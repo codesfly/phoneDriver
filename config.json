@@ -11,7 +11,7 @@
   "max_tokens": 512,
   "step_delay": 1.5,
   "enable_visual_debug": false,
-  "use_remote_api": false,
+  "use_remote_api": true,
   "api_base_url": "",
   "api_key": "",
   "api_model": "qwen3.5-plus",

@@ -164,7 +164,7 @@ def get_default_config():
         "max_tokens": 512,
         "step_delay": 1.5,
         "enable_visual_debug": False,
-        "use_remote_api": False,
+        "use_remote_api": True,
         "api_base_url": "",
         "api_key": "",
         "api_model": "qwen3.5-plus",

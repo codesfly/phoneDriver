@@ -113,9 +113,9 @@ python phone_agent.py "打开 TikTok 并刷一会视频"
 - `runtime_config_path`: 运行配置写回路径（用于自动写入分辨率）
 - `adb_command_timeout`: 单条 ADB 命令超时（秒）
 
-### 远端 API 模式（推荐）
+### 远端 API 模式（默认且推荐）
 
-- `use_remote_api`: `true/false`
+- `use_remote_api`: `true/false`（默认 `true`，优先走远端模型）
 - `api_base_url`: OpenAI 兼容接口地址
 - `api_key`: API Key
 - `api_model`: 例如 `qwen3.5-plus`

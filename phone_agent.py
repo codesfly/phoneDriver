@@ -200,7 +200,7 @@ class PhoneAgent:
             'step_delay': 1.5,  # Seconds to wait after each action
             'enable_visual_debug': False,  # Save annotated screenshots
             # Remote API mode (OpenAI-compatible)
-            'use_remote_api': False,
+            'use_remote_api': True,
             'api_base_url': '',
             'api_key': '',
             'api_model': 'qwen3.5-plus',
