@@ -60,7 +60,21 @@ def get_default_config():
         "temperature": 0.1,
         "max_tokens": 512,
         "step_delay": 1.5,
-        "enable_visual_debug": False
+        "enable_visual_debug": False,
+        "use_remote_api": False,
+        "api_base_url": "",
+        "api_key": "",
+        "api_model": "qwen3.5-plus",
+        "api_timeout": 120,
+        "adb_command_timeout": 15,
+        "ignore_terminate_for_continuous_tasks": True,
+        "continuous_min_cycles": 20,
+        "continuous_min_minutes": 0,
+        "enable_dynamic_retry_budget": True,
+        "retry_budget_simple": 2,
+        "retry_budget_medium": 4,
+        "retry_budget_complex": 6,
+        "retry_budget_cap": 8
     }
 
 
@@ -230,15 +244,31 @@ def update_ui():
 
 def stop_task():
     """Stop the currently running task."""
-    global is_running
+    global is_running, agent
     if is_running:
         logging.warning("Task stop requested by user")
+        try:
+            if agent is not None:
+                agent.context['stop_requested'] = True
+        except Exception:
+            pass
         is_running = False
         return "⚠️ Stopping task..."
     return "No task running"
 
 
-def apply_settings(screen_width, screen_height, temp, max_tok, step_delay, use_fa2, visual_debug):
+def apply_settings(
+    screen_width,
+    screen_height,
+    temp,
+    max_tok,
+    step_delay,
+    use_fa2,
+    visual_debug,
+    ignore_terminate_continuous,
+    continuous_min_cycles,
+    continuous_min_minutes,
+):
     """Apply settings changes to config."""
     global current_config
     
@@ -252,6 +282,10 @@ def apply_settings(screen_width, screen_height, temp, max_tok, step_delay, use_f
         config['step_delay'] = float(step_delay)
         config['use_flash_attention'] = use_fa2
         config['enable_visual_debug'] = visual_debug
+
+        config['ignore_terminate_for_continuous_tasks'] = bool(ignore_terminate_continuous)
+        config['continuous_min_cycles'] = max(1, int(continuous_min_cycles))
+        config['continuous_min_minutes'] = max(0.0, float(continuous_min_minutes))
         
         if save_config(config):
             current_config = config
@@ -387,6 +421,25 @@ def create_ui():
                         label="Enable Visual Debug",
                         value=current_config.get('enable_visual_debug', False)
                     )
+
+                gr.Markdown("### Continuous Task (刷一会/持续任务)")
+                with gr.Row():
+                    ignore_terminate_continuous = gr.Checkbox(
+                        label="Ignore early terminate for continuous tasks",
+                        value=current_config.get('ignore_terminate_for_continuous_tasks', True)
+                    )
+                    continuous_min_cycles = gr.Number(
+                        label="Continuous Min Cycles",
+                        value=current_config.get('continuous_min_cycles', 20),
+                        minimum=1,
+                        maximum=500
+                    )
+                    continuous_min_minutes = gr.Number(
+                        label="Continuous Min Minutes",
+                        value=current_config.get('continuous_min_minutes', 0),
+                        minimum=0,
+                        maximum=600
+                    )
                 
                 apply_btn = gr.Button("💾 Save Settings", variant="primary")
                 settings_status = gr.Textbox(label="Settings Status", interactive=False)
@@ -461,7 +514,10 @@ def create_ui():
                 max_tokens,
                 step_delay,
                 use_flash_attn,
-                visual_debug
+                visual_debug,
+                ignore_terminate_continuous,
+                continuous_min_cycles,
+                continuous_min_minutes,
             ],
             outputs=[settings_status, config_editor]
         )

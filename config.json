@@ -8,5 +8,19 @@
   "temperature": 0.1,
   "max_tokens": 512,
   "step_delay": 1.5,
-  "enable_visual_debug": true
+  "enable_visual_debug": false,
+  "use_remote_api": false,
+  "api_base_url": "",
+  "api_key": "",
+  "api_model": "qwen3.5-plus",
+  "api_timeout": 120,
+  "adb_command_timeout": 15,
+  "ignore_terminate_for_continuous_tasks": true,
+  "continuous_min_cycles": 20,
+  "continuous_min_minutes": 0,
+  "enable_dynamic_retry_budget": true,
+  "retry_budget_simple": 2,
+  "retry_budget_medium": 4,
+  "retry_budget_complex": 6,
+  "retry_budget_cap": 8
 }
