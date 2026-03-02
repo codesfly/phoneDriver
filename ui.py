@@ -78,7 +78,10 @@ def get_default_config():
         "enable_task_planner": True,
         "planner_max_steps": 8,
         "enable_checkpoint_recovery": True,
-        "checkpoint_dir": "./checkpoints"
+        "checkpoint_dir": "./checkpoints",
+        "enable_exception_handler": True,
+        "hitl_on_captcha": True,
+        "exception_network_backoff_ms": 2000
     }
 
 

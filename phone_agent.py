@@ -6,6 +6,7 @@ import math
 import hashlib
 import logging
 import subprocess
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
@@ -120,7 +121,38 @@ class PhoneAgent:
     - Executes actions through ADB commands
     - Tracks context and action history
     """
-    
+
+    EXCEPTION_KEYWORDS = {
+        'permission_popup': [
+            '权限', '允许', '始终允许', '仅在使用中允许', '仅在使用该应用时允许',
+            'permission', 'allow', 'deny', 'while using the app'
+        ],
+        'update_popup': [
+            '立即更新', '发现新版本', '版本更新', '升级', '更新应用',
+            'update', 'upgrade', 'new version', 'later', 'not now', 'skip'
+        ],
+        'login_guide': [
+            '登录后', '登录体验', '立即登录', '注册', '手机号登录', '一键登录', '游客',
+            'sign in', 'log in', 'login', 'create account', 'continue with'
+        ],
+        'network_error': [
+            '网络异常', '网络错误', '连接失败', '加载失败', '请求失败', '重试',
+            'network error', 'connection failed', 'no internet', 'request failed', 'retry'
+        ],
+        'captcha_entry': [
+            '验证码', '滑块', '拼图', '图形验证', '安全验证', '二次验证', '短信验证', '动态码',
+            'captcha', 'verify', 'verification', 'otp', '2fa', 'two-factor', 'security check'
+        ],
+    }
+
+    EXCEPTION_PRIORITY = [
+        'captcha_entry',
+        'permission_popup',
+        'update_popup',
+        'login_guide',
+        'network_error',
+    ]
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
         Initialize the phone agent.
@@ -162,6 +194,10 @@ class PhoneAgent:
             'planner_max_steps': 8,
             'enable_checkpoint_recovery': True,
             'checkpoint_dir': './checkpoints',
+            # Phase-3: UI exception handling
+            'enable_exception_handler': True,
+            'hitl_on_captcha': True,
+            'exception_network_backoff_ms': 2000,
         }
         
         self.config = default_config
@@ -210,6 +246,13 @@ class PhoneAgent:
         checkpoint_dir = str(self.config.get('checkpoint_dir', './checkpoints') or './checkpoints').strip()
         self.config['checkpoint_dir'] = checkpoint_dir
 
+        self.config['enable_exception_handler'] = bool(self.config.get('enable_exception_handler', True))
+        self.config['hitl_on_captcha'] = bool(self.config.get('hitl_on_captcha', True))
+        try:
+            self.config['exception_network_backoff_ms'] = max(500, int(self.config.get('exception_network_backoff_ms', 2000)))
+        except Exception:
+            self.config['exception_network_backoff_ms'] = 2000
+
         self.task_planner = TaskPlanner(max_steps=self.config['planner_max_steps'])
         self.current_plan: Optional[Dict[str, Any]] = None
         self.current_step_index: int = 0
@@ -224,7 +267,11 @@ class PhoneAgent:
             'continuous_task': False,
             'task_started_at': None,
             'session_id': datetime.now().strftime("%Y%m%d_%H%M%S"),
-            'screenshots': []
+            'screenshots': [],
+            'exception_events': [],
+            'last_exception_type': None,
+            'last_handler_action': None,
+            'last_hitl_triggered': False,
         }
         
         # Setup logging
@@ -337,7 +384,8 @@ class PhoneAgent:
     
     def _run_adb_command(self, command: str) -> str:
         """Execute an ADB command and return output."""
-        device_prefix = f"-s {self.config['device_id']}" if self.config['device_id'] else ""
+        device_id = self.config.get('device_id') if isinstance(self.config, dict) else None
+        device_prefix = f"-s {device_id}" if device_id else ""
         full_command = f"adb {device_prefix} {command}"
         timeout_s = int(self.config.get('adb_command_timeout', 15))
 
@@ -596,6 +644,175 @@ class PhoneAgent:
         logging.info(f"System action: {key_text} (KEYCODE {keycode})")
         self._run_adb_command(f"shell input keyevent {keycode}")
     
+    def _extract_text_tokens(self, screenshot_path: str) -> List[str]:
+        """Best-effort OCR/token extraction from UI XML dump for exception detection."""
+        tokens: List[str] = []
+
+        try:
+            remote_tmp = f"/sdcard/ui_dump_{self.context.get('session_id', 'sess')}.xml"
+            local_tmp = str(Path(self.config.get('screenshot_dir', './screenshots')) / f"ui_dump_{int(time.time())}.xml")
+
+            self._run_adb_command(f"shell uiautomator dump {remote_tmp}")
+            self._run_adb_command(f"pull {remote_tmp} {local_tmp}")
+            self._run_adb_command(f"shell rm {remote_tmp}")
+
+            if os.path.exists(local_tmp):
+                try:
+                    root = ET.parse(local_tmp).getroot()
+                    for node in root.iter('node'):
+                        for attr in ('text', 'content-desc', 'resource-id'):
+                            val = str(node.attrib.get(attr, '')).strip()
+                            if val:
+                                tokens.append(val)
+                finally:
+                    try:
+                        os.remove(local_tmp)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"UI dump unavailable for exception detection: {e}")
+
+        # fallback: attach model observation/reasoning snippets from recent actions
+        for item in self.context.get('previous_actions', [])[-3:]:
+            snippet = str(item.get('elementName', '')).strip()
+            if snippet:
+                tokens.append(snippet)
+
+        return tokens
+
+    def _detect_ui_exception(self, screenshot_path: str) -> Optional[str]:
+        """Detect common blocking UI exception state from visible text tokens."""
+        if not self.config.get('enable_exception_handler', True):
+            return None
+
+        tokens = self._extract_text_tokens(screenshot_path)
+        if not tokens:
+            return None
+
+        haystack = "\n".join(tokens).lower()
+        for exception_type in self.EXCEPTION_PRIORITY:
+            markers = self.EXCEPTION_KEYWORDS.get(exception_type, [])
+            if any(str(marker).lower() in haystack for marker in markers):
+                return exception_type
+        return None
+
+    def _record_exception_event(self, exception_type: Optional[str], handler_action: str, hitl_triggered: bool) -> None:
+        event = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'exception_type': exception_type,
+            'handler_action': handler_action,
+            'hitl_triggered': bool(hitl_triggered),
+        }
+        self.context.setdefault('exception_events', []).append(event)
+        self.context['last_exception_type'] = exception_type
+        self.context['last_handler_action'] = handler_action
+        self.context['last_hitl_triggered'] = bool(hitl_triggered)
+        logging.info(
+            f"Exception handling event: type={exception_type}, handler_action={handler_action}, hitl={hitl_triggered}"
+        )
+
+    def _select_exception_strategy(self, exception_type: Optional[str]) -> Dict[str, Any]:
+        """Select deterministic handler strategy for detected exception."""
+        if not exception_type:
+            return {'mode': 'none', 'handler_action': 'none', 'hitl': False, 'action': None}
+
+        if exception_type == 'captcha_entry':
+            if self.config.get('hitl_on_captcha', True):
+                return {
+                    'mode': 'hitl',
+                    'handler_action': 'trigger_hitl_captcha',
+                    'hitl': True,
+                    'action': {
+                        'action': 'terminate',
+                        'status': 'failure',
+                        'message': 'HITL required: captcha or secondary verification detected',
+                        'observation': 'captcha-entry-detected',
+                    }
+                }
+            return {'mode': 'none', 'handler_action': 'captcha_hitl_disabled', 'hitl': False, 'action': None}
+
+        if exception_type == 'permission_popup':
+            return {
+                'mode': 'blocking_popup',
+                'handler_action': 'tap_allow_permission',
+                'hitl': False,
+                'action': {
+                    'action': 'tap',
+                    'coordinates': [0.78, 0.90],
+                    'observation': 'exception-handler:allow-permission',
+                }
+            }
+
+        if exception_type == 'update_popup':
+            return {
+                'mode': 'blocking_popup',
+                'handler_action': 'tap_skip_update',
+                'hitl': False,
+                'action': {
+                    'action': 'tap',
+                    'coordinates': [0.22, 0.90],
+                    'observation': 'exception-handler:skip-update',
+                }
+            }
+
+        if exception_type == 'login_guide':
+            return {
+                'mode': 'blocking_popup',
+                'handler_action': 'tap_skip_login_guide',
+                'hitl': False,
+                'action': {
+                    'action': 'tap',
+                    'coordinates': [0.88, 0.08],
+                    'observation': 'exception-handler:close-login-guide',
+                }
+            }
+
+        if exception_type == 'network_error':
+            wait_ms = int(self.config.get('exception_network_backoff_ms', 2000))
+            return {
+                'mode': 'blocking_popup',
+                'handler_action': f'wait_network_recover_{wait_ms}ms',
+                'hitl': False,
+                'action': {
+                    'action': 'wait',
+                    'waitTime': wait_ms,
+                    'observation': 'exception-handler:network-backoff',
+                }
+            }
+
+        return {'mode': 'none', 'handler_action': 'none', 'hitl': False, 'action': None}
+
+    def _handle_detected_exception(self, screenshot_path: str) -> Optional[Dict[str, Any]]:
+        """Apply exception-first priority; return preemption result if handled."""
+        exception_type = self._detect_ui_exception(screenshot_path)
+        strategy = self._select_exception_strategy(exception_type)
+
+        if strategy.get('mode') == 'none':
+            return None
+
+        handler_action = str(strategy.get('handler_action', 'none'))
+        hitl_triggered = bool(strategy.get('hitl', False))
+        self._record_exception_event(exception_type, handler_action, hitl_triggered)
+
+        action = strategy.get('action')
+        if not action:
+            return None
+
+        result = self.execute_action(action)
+        result['screenshot_path'] = screenshot_path
+        result['planned_action'] = action
+        result['preempted_by_exception'] = True
+        result['exception_type'] = exception_type
+        result['handler_action'] = handler_action
+        result['hitl_triggered'] = hitl_triggered
+
+        # HITL must explicitly stop blind execution
+        if hitl_triggered:
+            result['task_complete'] = True
+            result['success'] = False
+
+        return result
+
     def _actions_equivalent(self, left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> bool:
         """Check whether two actions are effectively the same (to avoid blind retries)."""
         if not left or not right:
@@ -805,6 +1022,9 @@ class PhoneAgent:
         self.config.setdefault('planner_max_steps', 8)
         self.config.setdefault('enable_checkpoint_recovery', True)
         self.config.setdefault('checkpoint_dir', './checkpoints')
+        self.config.setdefault('enable_exception_handler', True)
+        self.config.setdefault('hitl_on_captcha', True)
+        self.config.setdefault('exception_network_backoff_ms', 2000)
 
         if not hasattr(self, 'task_planner') or self.task_planner is None:
             self.task_planner = TaskPlanner(max_steps=int(self.config.get('planner_max_steps', 8)))
@@ -817,6 +1037,13 @@ class PhoneAgent:
             self.step_status = {}
         if not hasattr(self, 'current_checkpoint_path'):
             self.current_checkpoint_path = None
+
+        if not hasattr(self, 'context') or not isinstance(self.context, dict):
+            self.context = {}
+        self.context.setdefault('exception_events', [])
+        self.context.setdefault('last_exception_type', None)
+        self.context.setdefault('last_handler_action', None)
+        self.context.setdefault('last_hitl_triggered', False)
 
     def _task_fingerprint(self, user_request: str) -> str:
         request = (user_request or '').strip()
@@ -1008,6 +1235,16 @@ class PhoneAgent:
                 self.context['last_action'] = last_action
                 self.context['last_screenshot'] = last_screenshot
 
+                if result.get('hitl_triggered'):
+                    last_error = str((last_action or {}).get('message') or 'HITL required by exception handler')
+                    logging.error(f"HITL triggered, stop autonomous retries: {last_error}")
+                    self._save_checkpoint(
+                        last_action=last_action,
+                        last_screenshot=last_screenshot,
+                        last_error=last_error,
+                    )
+                    break
+
                 terminate_failure = False
                 if result.get('task_complete'):
                     status = str((last_action or {}).get('status', 'success')).lower()
@@ -1151,13 +1388,17 @@ class PhoneAgent:
         """
         Execute a single interaction cycle.
 
-        Args:
-            user_request: The user's task request
-
-        Returns:
-            Result dictionary
+        Priority:
+            1) security/blocking exception handling
+            2) current step main flow
+            3) normal wait / fallback
         """
         screenshot_path = self.capture_screenshot()
+
+        # Exception-first preemption (Phase-3)
+        exception_result = self._handle_detected_exception(screenshot_path)
+        if exception_result is not None:
+            return exception_result
 
         action = self.vl_agent.analyze_screenshot(
             screenshot_path,
@@ -1178,6 +1419,10 @@ class PhoneAgent:
         result = self.execute_action(action)
         result['screenshot_path'] = screenshot_path
         result['planned_action'] = action
+        result.setdefault('preempted_by_exception', False)
+        result.setdefault('exception_type', None)
+        result.setdefault('handler_action', None)
+        result.setdefault('hitl_triggered', False)
         return result
     
     def execute_task(self, user_request: str, max_cycles: int = 15) -> Dict[str, Any]:
@@ -1199,6 +1444,10 @@ class PhoneAgent:
         self.context['retry_round'] = 0
         self.context['last_retry_reason'] = None
         self.context['retry_decisions'] = []
+        self.context['exception_events'] = []
+        self.context['last_exception_type'] = None
+        self.context['last_handler_action'] = None
+        self.context['last_hitl_triggered'] = False
 
         req_l = (user_request or '').lower()
         continuous_markers = [

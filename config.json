@@ -26,5 +26,8 @@
   "enable_task_planner": true,
   "planner_max_steps": 8,
   "enable_checkpoint_recovery": true,
-  "checkpoint_dir": "./checkpoints"
+  "checkpoint_dir": "./checkpoints",
+  "enable_exception_handler": true,
+  "hitl_on_captcha": true,
+  "exception_network_backoff_ms": 2000
 }
