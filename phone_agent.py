@@ -5,6 +5,7 @@ import time
 import math
 import hashlib
 import logging
+import statistics
 import subprocess
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -12,6 +13,29 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
 from qwen_vl_agent import QwenVLAgent
+
+
+def parse_wm_size_output(raw_output: str) -> Optional[Tuple[int, int]]:
+    """Parse `adb shell wm size` output and return (width, height)."""
+    text = str(raw_output or "").strip()
+    match = re.search(r"Physical size:\s*(\d+)x(\d+)", text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def parse_adb_devices_output(raw_output: str) -> List[Tuple[str, str]]:
+    """Parse `adb devices` output and return [(device_id, state), ...]."""
+    devices: List[Tuple[str, str]] = []
+    lines = str(raw_output or "").splitlines()
+    for line in lines:
+        text = line.strip()
+        if not text or text.lower().startswith("list of devices"):
+            continue
+        parts = text.split()
+        if len(parts) >= 2:
+            devices.append((parts[0].strip(), parts[1].strip()))
+    return devices
 
 
 class TaskPlanner:
@@ -167,6 +191,8 @@ class PhoneAgent:
             'screen_height': 2340,  # Must match your device
             'screenshot_dir': './screenshots',
             'max_retries': 3,
+            'use_fast_screencap': True,
+            'runtime_config_path': 'config.json',
             'model_name': 'Qwen/Qwen3-VL-30B-A3B-Instruct',
             'use_flash_attention': False,
             'temperature': 0.1,
@@ -217,6 +243,10 @@ class PhoneAgent:
             self.config['adb_command_timeout'] = max(3, int(self.config.get('adb_command_timeout', 15)))
         except Exception:
             self.config['adb_command_timeout'] = 15
+
+        self.config['use_fast_screencap'] = bool(self.config.get('use_fast_screencap', True))
+        runtime_config_path = str(self.config.get('runtime_config_path', 'config.json') or 'config.json').strip()
+        self.config['runtime_config_path'] = runtime_config_path or 'config.json'
 
         self.config['enable_dynamic_retry_budget'] = bool(self.config.get('enable_dynamic_retry_budget', True))
         try:
@@ -272,10 +302,13 @@ class PhoneAgent:
             'last_exception_type': None,
             'last_handler_action': None,
             'last_hitl_triggered': False,
+            'health_check': None,
+            'last_screencap_mode': None,
         }
         
         # Setup logging
         self._setup_logging()
+        logging.warning(self.get_tos_notice())
         
         # Initialize directories
         self._setup_directories()
@@ -320,67 +353,165 @@ class PhoneAgent:
         logging.info(f"Checkpoint directory: {self.config['checkpoint_dir']}")
     
     def _check_adb_connection(self):
-        """Verify ADB connection and get device info."""
+        """Run startup health check and fail-fast when connection is unhealthy."""
+        health = self.run_startup_health_check(persist_runtime_config=True)
+        if health.get('status') != 'ok':
+            raise Exception(
+                "Failed to connect via ADB or detect screen resolution. "
+                "Ensure ADB is installed, device debugging is enabled, and the device is authorized. "
+                f"Health detail: {health}"
+            )
+
+    def get_tos_notice(self) -> str:
+        return (
+            "[TOS/Compliance Notice] Mobile app automation may violate platform Terms of Service. "
+            "Use only on your own devices for personal testing and compliant scenarios."
+        )
+
+    def run_startup_health_check(self, persist_runtime_config: bool = True) -> Dict[str, Any]:
+        """Check ADB readiness, connected device, and real screen resolution."""
+        health: Dict[str, Any] = {
+            'checked_at': datetime.now().isoformat(timespec='seconds'),
+            'adb_available': False,
+            'device_connected': False,
+            'device_id': None,
+            'screen_width': None,
+            'screen_height': None,
+            'status': 'failed',
+            'errors': [],
+        }
+
         try:
-            # List devices
-            result = subprocess.run(
+            version_result = subprocess.run(
+                ["adb", "version"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=max(3, int(self.config.get('adb_command_timeout', 15))),
+            )
+            if version_result.stdout.strip() or version_result.stderr.strip():
+                health['adb_available'] = True
+        except Exception as e:
+            health['errors'].append(f"adb unavailable: {e}")
+            self.context['health_check'] = health
+            logging.error(f"ADB health check failed: {e}")
+            return health
+
+        try:
+            devices_result = subprocess.run(
                 ["adb", "devices"],
                 check=True,
                 capture_output=True,
-                text=True
+                text=True,
+                timeout=max(3, int(self.config.get('adb_command_timeout', 15))),
             )
-            
-            # Auto-detect device if not specified
-            if self.config['device_id'] is None:
-                lines = result.stdout.strip().split('\n')
-                if len(lines) > 1:
-                    device_info = lines[1].split('\t')
-                    if len(device_info) > 0 and device_info[1].strip() == 'device':
-                        self.config['device_id'] = device_info[0].strip()
-                        logging.info(f"Auto-detected device: {self.config['device_id']}")
-                    else:
-                        raise Exception("No authorized device found")
-                else:
-                    raise Exception("No devices connected")
-            
-            # Test connection
-            self._run_adb_command("shell echo 'Connected'")
-            logging.info("✓ ADB connection verified")
-            
-            # Get actual screen resolution
-            self._verify_screen_resolution()
-            
-        except subprocess.CalledProcessError as e:
-            logging.error(f"ADB error: {e}")
-            raise Exception(
-                "Failed to connect via ADB. Ensure USB debugging is enabled and device is authorized."
-            )
-    
-    def _verify_screen_resolution(self):
-        """Verify the configured screen resolution matches the device."""
+            devices = parse_adb_devices_output(devices_result.stdout)
+        except Exception as e:
+            health['errors'].append(f"adb devices failed: {e}")
+            self.context['health_check'] = health
+            logging.error(f"ADB device list failed: {e}")
+            return health
+
+        requested_device = str(self.config.get('device_id') or '').strip()
+        selected_device: Optional[str] = None
+
+        if requested_device:
+            for device_id, state in devices:
+                if device_id == requested_device and state == 'device':
+                    selected_device = device_id
+                    break
+            if not selected_device:
+                health['errors'].append(f"configured device not ready: {requested_device}")
+        else:
+            for device_id, state in devices:
+                if state == 'device':
+                    selected_device = device_id
+                    break
+            if selected_device:
+                self.config['device_id'] = selected_device
+
+        if not selected_device:
+            if not health['errors']:
+                health['errors'].append('no authorized device connected')
+            self.context['health_check'] = health
+            logging.error(f"ADB health check failed: {health['errors']}")
+            return health
+
+        health['device_connected'] = True
+        health['device_id'] = selected_device
+
         try:
-            result = self._run_adb_command("shell wm size")
-            # Output format: "Physical size: 1080x2340"
-            if "Physical size:" in result:
-                size_str = result.split("Physical size:")[1].strip()
-                width, height = map(int, size_str.split('x'))
-                
-                if width != self.config['screen_width'] or height != self.config['screen_height']:
+            self._run_adb_command("shell echo 'Connected'")
+            size_output = self._run_adb_command("shell wm size")
+            size = parse_wm_size_output(size_output)
+            if not size:
+                health['errors'].append(f"unable to parse wm size output: {size_output.strip()}")
+            else:
+                width, height = size
+                health['screen_width'] = width
+                health['screen_height'] = height
+                if width != self.config.get('screen_width') or height != self.config.get('screen_height'):
                     logging.warning("=" * 60)
                     logging.warning("RESOLUTION MISMATCH DETECTED!")
                     logging.warning(f"Device actual:    {width} x {height}")
-                    logging.warning(f"Config setting:   {self.config['screen_width']} x {self.config['screen_height']}")
-                    logging.warning("Please update config.json with correct resolution!")
+                    logging.warning(f"Config setting:   {self.config.get('screen_width')} x {self.config.get('screen_height')}")
+                    logging.warning("Auto-updating runtime config resolution")
                     logging.warning("=" * 60)
-                    
-                    # Update config automatically
-                    self.config['screen_width'] = width
-                    self.config['screen_height'] = height
-                    logging.info(f"Auto-corrected to: {width} x {height}")
-                else:
-                    logging.info(f"✓ Screen resolution confirmed: {width} x {height}")
+                self.config['screen_width'] = width
+                self.config['screen_height'] = height
+                if persist_runtime_config:
+                    self._persist_runtime_resolution(width, height)
         except Exception as e:
-            logging.warning(f"Could not verify screen resolution: {e}")
+            health['errors'].append(f"device probe failed: {e}")
+
+        health['status'] = 'ok' if (
+            health['adb_available']
+            and health['device_connected']
+            and bool(health.get('screen_width'))
+            and bool(health.get('screen_height'))
+            and not health['errors']
+        ) else 'failed'
+
+        self.context['health_check'] = health
+        if health['status'] == 'ok':
+            logging.info("✓ Startup health check passed")
+            logging.info(
+                f"Health: device={health['device_id']}, resolution={health['screen_width']}x{health['screen_height']}"
+            )
+        else:
+            logging.error(f"Startup health check failed: {health}")
+        return health
+
+    def _persist_runtime_resolution(self, width: int, height: int) -> bool:
+        """Persist detected resolution into runtime config file (no sensitive fields)."""
+        config_path = str(self.config.get('runtime_config_path', 'config.json') or 'config.json').strip()
+        if not config_path:
+            config_path = 'config.json'
+
+        target_path = Path(config_path)
+        if not target_path.is_absolute():
+            target_path = Path.cwd() / target_path
+
+        payload: Dict[str, Any] = {}
+        if target_path.exists():
+            try:
+                with open(target_path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+            except Exception as e:
+                logging.error(f"Failed to read runtime config before persistence: {e}")
+                return False
+
+        payload['screen_width'] = int(width)
+        payload['screen_height'] = int(height)
+
+        try:
+            with open(target_path, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            logging.info(f"Runtime config updated with detected resolution: {target_path}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to persist detected resolution: {e}")
+            return False
     
     def _run_adb_command(self, command: str) -> str:
         """Execute an ADB command and return output."""
@@ -415,32 +546,136 @@ class PhoneAgent:
                 logging.error(f"ADB stdout: {stdout}")
             raise
     
+    def _capture_screenshot_fast(self, screenshot_path: str) -> None:
+        """Fast path: adb exec-out screencap -p > local file."""
+        device_id = self.config.get('device_id') if isinstance(self.config, dict) else None
+        command = ["adb"]
+        if device_id:
+            command.extend(["-s", str(device_id)])
+        command.extend(["exec-out", "screencap", "-p"])
+
+        timeout_s = int(self.config.get('adb_command_timeout', 15))
+        with open(screenshot_path, 'wb') as out_f:
+            proc = subprocess.run(
+                command,
+                check=True,
+                stdout=out_f,
+                stderr=subprocess.PIPE,
+                timeout=timeout_s,
+            )
+
+        if proc.stderr:
+            stderr = proc.stderr.decode('utf-8', errors='ignore').strip()
+            if stderr:
+                logging.info(f"Fast screencap stderr: {stderr}")
+
+        if not os.path.exists(screenshot_path) or os.path.getsize(screenshot_path) <= 8:
+            raise RuntimeError("fast screencap output file is empty")
+
+        with open(screenshot_path, 'rb') as check_f:
+            head = check_f.read(8)
+        if head != b'\x89PNG\r\n\x1a\n':
+            raise RuntimeError("fast screencap output is not a valid PNG")
+
+    def _capture_screenshot_legacy(self, screenshot_path: str) -> None:
+        """Legacy path: adb shell screencap + adb pull."""
+        self._run_adb_command("shell screencap -p /sdcard/screenshot.png")
+        self._run_adb_command(f"pull /sdcard/screenshot.png {screenshot_path}")
+        self._run_adb_command("shell rm /sdcard/screenshot.png")
+
     def capture_screenshot(self) -> str:
         """
         Capture a screenshot from the device.
-        
+
         Returns:
             Path to the saved screenshot
         """
-        timestamp = int(time.time())
+        timestamp = int(time.time() * 1000)
         screenshot_path = os.path.join(
             self.config['screenshot_dir'],
             f"screen_{self.context['session_id']}_{timestamp}.png"
         )
-        
+
+        use_fast = bool(self.config.get('use_fast_screencap', True))
+
         try:
-            # Capture and transfer screenshot
-            self._run_adb_command("shell screencap -p /sdcard/screenshot.png")
-            self._run_adb_command(f"pull /sdcard/screenshot.png {screenshot_path}")
-            self._run_adb_command("shell rm /sdcard/screenshot.png")
-            
-            logging.info(f"Screenshot captured: {screenshot_path}")
+            if use_fast:
+                try:
+                    self._capture_screenshot_fast(screenshot_path)
+                    self.context['last_screencap_mode'] = 'fast'
+                    logging.info(f"Screenshot captured (fast): {screenshot_path}")
+                except Exception as fast_error:
+                    logging.warning(f"Fast screencap failed, fallback to legacy path: {fast_error}")
+                    self._capture_screenshot_legacy(screenshot_path)
+                    self.context['last_screencap_mode'] = 'legacy_fallback'
+                    logging.info(f"Screenshot captured (legacy fallback): {screenshot_path}")
+            else:
+                self._capture_screenshot_legacy(screenshot_path)
+                self.context['last_screencap_mode'] = 'legacy'
+                logging.info(f"Screenshot captured (legacy): {screenshot_path}")
+
             self.context['screenshots'].append(screenshot_path)
             return screenshot_path
-            
+
         except Exception as e:
             logging.error(f"Screenshot capture failed: {e}")
             raise
+
+    def benchmark_screenshot_performance(self, sample_count: int = 10) -> Dict[str, Any]:
+        """Benchmark fast vs legacy screenshot path and report avg/p50/p95 milliseconds."""
+        samples = max(10, int(sample_count))
+
+        def _run_mode(mode: str) -> Dict[str, Any]:
+            durations_ms: List[float] = []
+            errors: List[str] = []
+
+            for i in range(samples):
+                path = os.path.join(
+                    self.config['screenshot_dir'],
+                    f"bench_{mode}_{self.context.get('session_id', 'sess')}_{int(time.time() * 1000)}_{i}.png"
+                )
+                start = time.perf_counter()
+                try:
+                    if mode == 'fast':
+                        self._capture_screenshot_fast(path)
+                    else:
+                        self._capture_screenshot_legacy(path)
+                    durations_ms.append((time.perf_counter() - start) * 1000.0)
+                except Exception as e:
+                    errors.append(str(e))
+                finally:
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except Exception:
+                        pass
+
+            result: Dict[str, Any] = {
+                'mode': mode,
+                'samples': len(durations_ms),
+                'requested_samples': samples,
+                'errors': errors,
+            }
+            if durations_ms:
+                sorted_samples = sorted(durations_ms)
+                result.update({
+                    'avg_ms': round(sum(durations_ms) / len(durations_ms), 2),
+                    'p50_ms': round(statistics.median(sorted_samples), 2),
+                    'p95_ms': round(sorted_samples[max(0, min(len(sorted_samples) - 1, math.ceil(len(sorted_samples) * 0.95) - 1))], 2),
+                })
+            return result
+
+        fast_result = _run_mode('fast')
+        legacy_result = _run_mode('legacy')
+
+        report = {
+            'checked_at': datetime.now().isoformat(timespec='seconds'),
+            'sample_count': samples,
+            'fast': fast_result,
+            'legacy': legacy_result,
+        }
+        logging.info(f"Screenshot benchmark report: {report}")
+        return report
     
     def execute_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1025,6 +1260,8 @@ class PhoneAgent:
         self.config.setdefault('enable_exception_handler', True)
         self.config.setdefault('hitl_on_captcha', True)
         self.config.setdefault('exception_network_backoff_ms', 2000)
+        self.config.setdefault('use_fast_screencap', True)
+        self.config.setdefault('runtime_config_path', 'config.json')
 
         if not hasattr(self, 'task_planner') or self.task_planner is None:
             self.task_planner = TaskPlanner(max_steps=int(self.config.get('planner_max_steps', 8)))
@@ -1044,6 +1281,9 @@ class PhoneAgent:
         self.context.setdefault('last_exception_type', None)
         self.context.setdefault('last_handler_action', None)
         self.context.setdefault('last_hitl_triggered', False)
+        self.context.setdefault('health_check', None)
+        self.context.setdefault('last_screencap_mode', None)
+        self.context.setdefault('screenshots', [])
 
     def _task_fingerprint(self, user_request: str) -> str:
         request = (user_request or '').strip()

@@ -15,7 +15,9 @@
 - 🖥️ **Web UI**：内置 Gradio，可视化执行任务
 - 🔁 **连续任务支持**：可配置持续轮次/时长，避免过早 terminate
 - 🧭 **失败反馈闭环（Phase-1）**：失败后自动重截图、分类原因并请求修正动作
-- 📊 **可观测性增强**：记录 retry reason、修正决策、ADB stderr/stdout
+- ⚡ **快速截屏 + 回退机制（P0）**：默认 `adb exec-out screencap -p`，失败显式回退 legacy 路径
+- 🩺 **启动健康检测（P0）**：自动检测 ADB/设备连接/分辨率，支持 UI 一键刷新
+- 📊 **可观测性增强**：记录 retry reason、修正决策、ADB stderr/stdout、截屏路径模式
 
 ---
 
@@ -102,6 +104,8 @@ python phone_agent.py "打开 TikTok 并刷一会视频"
 - `screen_width` / `screen_height`: 分辨率
 - `step_delay`: 动作间隔秒数
 - `max_retries`: 基础重试上限
+- `use_fast_screencap`: 是否启用快速截图主路径（默认 `true`）
+- `runtime_config_path`: 运行配置写回路径（用于自动写入分辨率）
 - `adb_command_timeout`: 单条 ADB 命令超时（秒）
 
 ### 远端 API 模式（推荐）
@@ -192,6 +196,19 @@ PYTHONPATH=. python tests/test_phase1_smoke.py
 - 变更提交前至少保证：`py_compile` 通过
 
 ---
+
+## 合规与风险提示（Compliance & TOS）
+
+- 移动端自动化可能违反目标平台的 **Terms of Service (TOS)**。
+- 本项目仅建议用于：
+  - 个人自有设备测试
+  - 合法授权场景
+  - 合规研发验证
+- 禁止用于：
+  - 绕过风控/反作弊
+  - 设备伪装或对抗性自动化
+  - 未授权账号批量操作
+- 若平台策略与本项目能力存在冲突，以平台条款和当地法律法规为准。
 
 ## License
 

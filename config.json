@@ -1,9 +1,11 @@
 {
   "device_id": null,
   "screen_width": 1080,
-  "screen_height": 2340,
+  "screen_height": 2400,
   "screenshot_dir": "./screenshots",
   "max_retries": 3,
+  "use_fast_screencap": true,
+  "runtime_config_path": "config.json",
   "use_flash_attention": true,
   "temperature": 0.1,
   "max_tokens": 512,
