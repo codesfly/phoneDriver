@@ -1,14 +1,113 @@
 import os
+import re
 import json
 import time
 import math
+import hashlib
 import logging
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 from qwen_vl_agent import QwenVLAgent
+
+
+class TaskPlanner:
+    """Lightweight rule-based task planner for phase-2 step decomposition."""
+
+    REQUIRED_KEYS = ("step_name", "instruction", "success_criteria")
+
+    def __init__(self, max_steps: int = 8):
+        self.max_steps = max(1, int(max_steps))
+
+    def build_plan(self, user_request: str) -> Dict[str, Any]:
+        request = (user_request or "").strip()
+        if not request:
+            raise ValueError("TaskPlanner requires a non-empty user request")
+
+        raw_steps = self._split_request(request)
+        if not raw_steps:
+            raw_steps = [request]
+
+        steps: List[Dict[str, str]] = []
+        for idx, fragment in enumerate(raw_steps[: self.max_steps], start=1):
+            instruction = fragment.strip()
+            if not instruction:
+                continue
+
+            short_title = instruction
+            if len(short_title) > 36:
+                short_title = short_title[:33].rstrip() + "..."
+
+            steps.append(
+                {
+                    "step_name": f"Step {idx}: {short_title}",
+                    "instruction": instruction,
+                    "success_criteria": f"已完成：{instruction}，并且界面可继续下一步。",
+                }
+            )
+
+        if not steps:
+            steps = [
+                {
+                    "step_name": "Step 1: 执行任务",
+                    "instruction": request,
+                    "success_criteria": f"已完成：{request}。",
+                }
+            ]
+
+        plan = {
+            "planner_version": "phase2-v1",
+            "task": request,
+            "steps": steps,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        self.validate_plan(plan)
+        return plan
+
+    def validate_plan(self, plan: Dict[str, Any]) -> bool:
+        if not isinstance(plan, dict):
+            raise ValueError("Task plan must be a dictionary")
+
+        steps = plan.get("steps")
+        if not isinstance(steps, list) or not steps:
+            raise ValueError("Task plan must contain a non-empty steps list")
+
+        for idx, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise ValueError(f"Step #{idx + 1} must be a dictionary")
+            for key in self.REQUIRED_KEYS:
+                value = str(step.get(key, "")).strip()
+                if not value:
+                    raise ValueError(f"Step #{idx + 1} missing required field: {key}")
+
+        return True
+
+    def _split_request(self, request: str) -> List[str]:
+        text = request.strip()
+
+        # First pass: punctuation / line breaks
+        tokens = re.split(r"(?:[\n;；。]+)", text)
+        parts: List[str] = []
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+
+            # Second pass: common connectors (CN + EN)
+            fragments = re.split(
+                r"(?:\s+and then\s+|\s+then\s+|\s+next\s+|\s+finally\s+|然后|并且|接着|再|最后)",
+                token,
+                flags=re.IGNORECASE,
+            )
+            for frag in fragments:
+                frag = frag.strip(" ,，")
+                if frag:
+                    parts.append(frag)
+
+        return parts
 
 
 class PhoneAgent:
@@ -58,6 +157,11 @@ class PhoneAgent:
             'retry_budget_medium': 4,
             'retry_budget_complex': 6,
             'retry_budget_cap': 8,
+            # Phase-2: task planner + checkpoint recovery
+            'enable_task_planner': True,
+            'planner_max_steps': 8,
+            'enable_checkpoint_recovery': True,
+            'checkpoint_dir': './checkpoints',
         }
         
         self.config = default_config
@@ -95,6 +199,22 @@ class PhoneAgent:
             self.config['retry_budget_cap'] = max(1, int(self.config.get('retry_budget_cap', 8)))
         except Exception:
             self.config['retry_budget_cap'] = 8
+
+        self.config['enable_task_planner'] = bool(self.config.get('enable_task_planner', True))
+        try:
+            self.config['planner_max_steps'] = max(1, int(self.config.get('planner_max_steps', 8)))
+        except Exception:
+            self.config['planner_max_steps'] = 8
+        self.config['enable_checkpoint_recovery'] = bool(self.config.get('enable_checkpoint_recovery', True))
+
+        checkpoint_dir = str(self.config.get('checkpoint_dir', './checkpoints') or './checkpoints').strip()
+        self.config['checkpoint_dir'] = checkpoint_dir
+
+        self.task_planner = TaskPlanner(max_steps=self.config['planner_max_steps'])
+        self.current_plan: Optional[Dict[str, Any]] = None
+        self.current_step_index: int = 0
+        self.step_status: Dict[str, str] = {}
+        self.current_checkpoint_path: Optional[str] = None
 
         # Session context
         self.context = {
@@ -148,7 +268,9 @@ class PhoneAgent:
     def _setup_directories(self):
         """Create necessary directories."""
         Path(self.config['screenshot_dir']).mkdir(parents=True, exist_ok=True)
+        Path(self.config['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
         logging.info(f"Screenshots directory: {self.config['screenshot_dir']}")
+        logging.info(f"Checkpoint directory: {self.config['checkpoint_dir']}")
     
     def _check_adb_connection(self):
         """Verify ADB connection and get device info."""
@@ -674,6 +796,357 @@ class PhoneAgent:
         )
         return corrected_result
 
+    def _ensure_phase2_runtime_state(self) -> None:
+        """Initialize phase-2 runtime fields for tests/backward compatibility."""
+        if not hasattr(self, 'config') or not isinstance(self.config, dict):
+            self.config = {}
+
+        self.config.setdefault('enable_task_planner', True)
+        self.config.setdefault('planner_max_steps', 8)
+        self.config.setdefault('enable_checkpoint_recovery', True)
+        self.config.setdefault('checkpoint_dir', './checkpoints')
+
+        if not hasattr(self, 'task_planner') or self.task_planner is None:
+            self.task_planner = TaskPlanner(max_steps=int(self.config.get('planner_max_steps', 8)))
+
+        if not hasattr(self, 'current_plan'):
+            self.current_plan = None
+        if not hasattr(self, 'current_step_index'):
+            self.current_step_index = 0
+        if not hasattr(self, 'step_status') or not isinstance(self.step_status, dict):
+            self.step_status = {}
+        if not hasattr(self, 'current_checkpoint_path'):
+            self.current_checkpoint_path = None
+
+    def _task_fingerprint(self, user_request: str) -> str:
+        request = (user_request or '').strip()
+        return hashlib.sha256(request.encode('utf-8')).hexdigest()[:16]
+
+    def _get_checkpoint_path(self, user_request: str) -> str:
+        task_key = self._task_fingerprint(user_request)
+        checkpoint_dir = self.config.get('checkpoint_dir', './checkpoints')
+        return str(Path(checkpoint_dir) / f"task_{task_key}.json")
+
+    def _default_step_status(self, steps: List[Dict[str, Any]]) -> Dict[str, str]:
+        return {str(i): 'pending' for i in range(len(steps))}
+
+    def _load_checkpoint(self, user_request: str) -> Optional[Dict[str, Any]]:
+        self._ensure_phase2_runtime_state()
+        checkpoint_path = self._get_checkpoint_path(user_request)
+        if not os.path.exists(checkpoint_path):
+            return None
+
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Checkpoint JSON corrupted: {checkpoint_path} ({e})")
+
+        expected = self._task_fingerprint(user_request)
+        if payload.get('task_fingerprint') != expected:
+            logging.warning("Checkpoint fingerprint mismatch, ignore stale checkpoint")
+            return None
+
+        plan = payload.get('plan')
+        self.task_planner.validate_plan(plan)
+
+        step_status = payload.get('step_status')
+        if not isinstance(step_status, dict):
+            raise RuntimeError('Checkpoint missing step_status dictionary')
+
+        idx_raw = payload.get('current_step_index', 0)
+        try:
+            current_step_index = max(0, int(idx_raw))
+        except Exception:
+            raise RuntimeError(f"Invalid checkpoint current_step_index: {idx_raw}")
+
+        payload['current_step_index'] = current_step_index
+        payload['checkpoint_path'] = checkpoint_path
+        return payload
+
+    def _save_checkpoint(
+        self,
+        *,
+        last_action: Optional[Dict[str, Any]] = None,
+        last_screenshot: Optional[str] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        self._ensure_phase2_runtime_state()
+        if not self.config.get('enable_checkpoint_recovery', True):
+            return
+
+        task_request = self.context.get('task_request', '')
+        if not task_request:
+            return
+
+        checkpoint_path = self.current_checkpoint_path or self._get_checkpoint_path(task_request)
+        self.current_checkpoint_path = checkpoint_path
+        Path(checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            'task_fingerprint': self._task_fingerprint(task_request),
+            'task_request': task_request,
+            'plan': self.current_plan,
+            'current_step_index': int(self.current_step_index),
+            'step_status': dict(self.step_status),
+            'last_action': last_action if last_action is not None else self.context.get('last_action'),
+            'last_screenshot': last_screenshot if last_screenshot is not None else self.context.get('last_screenshot'),
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+        }
+
+        if last_error:
+            payload['last_error'] = str(last_error)
+
+        tmp_path = checkpoint_path + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, checkpoint_path)
+
+    def _clear_checkpoint(self) -> None:
+        checkpoint_path = self.current_checkpoint_path
+        if not checkpoint_path:
+            return
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+            logging.info(f"Checkpoint cleared: {checkpoint_path}")
+
+    def _build_step_prompt(self, full_request: str, step: Dict[str, Any]) -> str:
+        instruction = str(step.get('instruction', '')).strip()
+        success_criteria = str(step.get('success_criteria', '')).strip()
+        return (
+            f"总体任务：{full_request}\n"
+            f"当前仅执行此步骤：{instruction}\n"
+            f"步骤完成标准：{success_criteria}"
+        )
+
+    def _prepare_plan_and_recovery(self, user_request: str) -> Tuple[Dict[str, Any], int, bool]:
+        self._ensure_phase2_runtime_state()
+        checkpoint_path = self._get_checkpoint_path(user_request)
+        self.current_checkpoint_path = checkpoint_path
+
+        if self.config.get('enable_checkpoint_recovery', True):
+            payload = self._load_checkpoint(user_request)
+            if payload:
+                self.current_plan = payload['plan']
+                self.step_status = payload['step_status']
+                self.current_step_index = min(
+                    int(payload.get('current_step_index', 0)),
+                    len(self.current_plan.get('steps', [])),
+                )
+                if payload.get('last_action') is not None:
+                    self.context['last_action'] = payload.get('last_action')
+                if payload.get('last_screenshot') is not None:
+                    self.context['last_screenshot'] = payload.get('last_screenshot')
+                logging.info(
+                    f"Checkpoint recovery enabled: resume from step index {self.current_step_index}"
+                )
+                return self.current_plan, self.current_step_index, True
+
+        if self.config.get('enable_task_planner', True):
+            plan = self.task_planner.build_plan(user_request)
+        else:
+            plan = {
+                'planner_version': 'phase2-v1-disabled',
+                'task': user_request,
+                'steps': [
+                    {
+                        'step_name': 'Step 1: 执行任务',
+                        'instruction': user_request,
+                        'success_criteria': f"已完成：{user_request}。",
+                    }
+                ],
+                'generated_at': datetime.now().isoformat(timespec='seconds'),
+            }
+
+        self.task_planner.validate_plan(plan)
+        self.current_plan = plan
+        self.current_step_index = 0
+        self.step_status = self._default_step_status(plan['steps'])
+        return plan, 0, False
+
+    def _execute_step_cycles(self, step_prompt: str, max_cycles: int = 15) -> Dict[str, Any]:
+        self.context['retry_round'] = 0
+        self.context['last_retry_reason'] = None
+        self.context['retry_decisions'] = []
+
+        effective_max_cycles = max(1, int(max_cycles))
+        min_cycles = max(1, int(self.config.get('continuous_min_cycles', 20)))
+        min_minutes = max(0.0, float(self.config.get('continuous_min_minutes', 0) or 0))
+        avg_cycle_seconds = max(1.0, float(self.config.get('step_delay', 1.5)) + 8.0)
+
+        if self.context.get('continuous_task'):
+            required_by_time = math.ceil((min_minutes * 60.0) / avg_cycle_seconds) if min_minutes > 0 else 0
+            planned_min_cycles = max(min_cycles, required_by_time)
+            if effective_max_cycles < planned_min_cycles:
+                logging.info(
+                    f"Continuous task detected: override max_cycles {effective_max_cycles} -> {planned_min_cycles} "
+                    f"(min_cycles={min_cycles}, min_minutes={min_minutes}, est_cycle={avg_cycle_seconds:.1f}s)"
+                )
+                effective_max_cycles = planned_min_cycles
+
+        retry_level, retry_budget = self._resolve_retry_budget(step_prompt)
+        logging.info(
+            f"Retry budget resolved: level={retry_level}, budget={retry_budget}, cap={self.config.get('retry_budget_cap', 8)}"
+        )
+
+        cycles = 0
+        step_complete = False
+        last_error = None
+        consecutive_failures = 0
+        last_action: Optional[Dict[str, Any]] = None
+        last_screenshot: Optional[str] = None
+
+        while cycles < effective_max_cycles and not step_complete and not self.context.get('stop_requested', False):
+            cycles += 1
+            self.context['cycle_index'] = cycles
+            logging.info(f"\n--- Cycle {cycles}/{effective_max_cycles} ---")
+
+            try:
+                result = self.execute_cycle(step_prompt)
+                last_action = result.get('planned_action') or result.get('action')
+                last_screenshot = result.get('screenshot_path')
+                self.context['last_action'] = last_action
+                self.context['last_screenshot'] = last_screenshot
+
+                terminate_failure = False
+                if result.get('task_complete'):
+                    status = str((last_action or {}).get('status', 'success')).lower()
+                    if (last_action or {}).get('action') == 'terminate' and status == 'failure':
+                        terminate_failure = True
+                        last_error = str((last_action or {}).get('message') or 'Step reported failure')
+                        logging.warning(f"Step terminate=failure, will retry: {last_error}")
+                    else:
+                        step_complete = True
+                        self._save_checkpoint(last_action=last_action, last_screenshot=last_screenshot)
+                        logging.info("✓ Step marked complete by agent")
+                        break
+
+                if terminate_failure or not result['success']:
+                    if not terminate_failure:
+                        last_error = result.get('error', 'Unknown error')
+                    failed_action = result.get('action') or result.get('planned_action') or {}
+                    retry_reason = self._classify_retry_reason(last_error, failed_action)
+                    logging.warning(f"Action failed: reason={retry_reason}, error={last_error}")
+
+                    corrected_result = self._run_failure_feedback_loop(
+                        user_request=step_prompt,
+                        failed_action=failed_action,
+                        failed_error=last_error,
+                        cycle_index=cycles,
+                    )
+
+                    corrected_action = corrected_result.get('corrected_action') or corrected_result.get('action')
+                    if corrected_action is not None:
+                        self.context['last_action'] = corrected_action
+                    if self.context.get('screenshots'):
+                        self.context['last_screenshot'] = self.context['screenshots'][-1]
+
+                    if corrected_result.get('task_complete'):
+                        corrected_status = str((corrected_action or {}).get('status', 'success')).lower()
+                        if corrected_status == 'failure':
+                            last_error = str((corrected_action or {}).get('message') or 'Correction terminate failure')
+                            consecutive_failures += 1
+                            logging.warning(
+                                f"Correction ended with terminate=failure (consecutive={consecutive_failures}/{retry_budget}): {last_error}"
+                            )
+                            if consecutive_failures >= retry_budget:
+                                break
+                        else:
+                            step_complete = True
+                            self._save_checkpoint(
+                                last_action=corrected_action,
+                                last_screenshot=self.context.get('last_screenshot'),
+                            )
+                            logging.info("✓ Step completed during correction loop")
+                            break
+                    elif corrected_result.get('success'):
+                        consecutive_failures = 0
+                        logging.info(
+                            f"Correction applied successfully (reason={corrected_result.get('retry_reason', retry_reason)})."
+                        )
+                    else:
+                        last_error = corrected_result.get('error', last_error)
+                        consecutive_failures += 1
+                        logging.warning(
+                            f"Correction failed (consecutive={consecutive_failures}/{retry_budget}): {last_error}"
+                        )
+                        if consecutive_failures >= retry_budget:
+                            logging.error(f"Max retries exceeded (budget={retry_budget})")
+                            break
+                else:
+                    consecutive_failures = 0
+
+                self._save_checkpoint(
+                    last_action=self.context.get('last_action'),
+                    last_screenshot=self.context.get('last_screenshot'),
+                    last_error=last_error,
+                )
+
+            except KeyboardInterrupt:
+                logging.info("Task interrupted by user")
+                self._save_checkpoint(
+                    last_action=self.context.get('last_action'),
+                    last_screenshot=self.context.get('last_screenshot'),
+                    last_error='KeyboardInterrupt',
+                )
+                raise
+            except Exception as e:
+                last_error = str(e)
+                retry_reason = self._classify_retry_reason(last_error, None)
+                consecutive_failures += 1
+                logging.error(
+                    f"Cycle error (consecutive={consecutive_failures}/{retry_budget}, reason={retry_reason}): {e}"
+                )
+
+                self._save_checkpoint(
+                    last_action=self.context.get('last_action'),
+                    last_screenshot=self.context.get('last_screenshot'),
+                    last_error=last_error,
+                )
+
+                if consecutive_failures >= retry_budget:
+                    logging.error(f"Max retries exceeded (budget={retry_budget})")
+                    break
+
+                time.sleep(2)
+
+        if cycles >= effective_max_cycles and not step_complete and not self.context.get('stop_requested', False):
+            elapsed = max(0.0, time.time() - float(self.context.get('task_started_at') or time.time()))
+
+            if self.context.get('continuous_task') and min_minutes > 0 and elapsed < min_minutes * 60:
+                logging.info(
+                    f"Continuous run reached cycle budget before time target: elapsed={elapsed:.1f}s < {min_minutes*60:.1f}s"
+                )
+            else:
+                logging.info("Max cycles reached, checking if current step is actually complete...")
+                screenshot_path = self.capture_screenshot()
+                self.context['last_screenshot'] = screenshot_path
+                completion_check = self.vl_agent.check_task_completion(
+                    screenshot_path,
+                    step_prompt,
+                    self.context
+                )
+                if completion_check.get('complete'):
+                    step_complete = True
+                    logging.info(f"✓ Step verified complete: {completion_check.get('reason')}")
+                else:
+                    last_error = completion_check.get('reason') or last_error
+
+                self._save_checkpoint(
+                    last_action=self.context.get('last_action'),
+                    last_screenshot=self.context.get('last_screenshot'),
+                    last_error=last_error,
+                )
+
+        return {
+            'success': bool(step_complete),
+            'task_complete': bool(step_complete),
+            'cycles': cycles,
+            'last_error': last_error,
+            'last_action': self.context.get('last_action'),
+            'last_screenshot': self.context.get('last_screenshot'),
+        }
+
     def execute_cycle(self, user_request: str) -> Dict[str, Any]:
         """
         Execute a single interaction cycle.
@@ -713,11 +1186,13 @@ class PhoneAgent:
 
         Args:
             user_request: The user's task description
-            max_cycles: Maximum number of action cycles
+            max_cycles: Maximum number of action cycles per step
 
         Returns:
             Task result dictionary
         """
+        self._ensure_phase2_runtime_state()
+
         self.context['task_request'] = user_request
         self.context['stop_requested'] = False
         self.context['task_started_at'] = time.time()
@@ -732,154 +1207,122 @@ class PhoneAgent:
         ]
         self.context['continuous_task'] = any(k in req_l for k in continuous_markers)
 
-        # Time/cycle planning: ensure cycle budget can satisfy min_minutes when configured.
-        effective_max_cycles = max(1, int(max_cycles))
-        min_cycles = max(1, int(self.config.get('continuous_min_cycles', 20)))
-        min_minutes = max(0.0, float(self.config.get('continuous_min_minutes', 0) or 0))
-        avg_cycle_seconds = max(1.0, float(self.config.get('step_delay', 1.5)) + 8.0)
-
+        logging.info('=' * 60)
+        logging.info(f'STARTING TASK: {user_request}')
         if self.context['continuous_task']:
-            required_by_time = math.ceil((min_minutes * 60.0) / avg_cycle_seconds) if min_minutes > 0 else 0
-            planned_min_cycles = max(min_cycles, required_by_time)
-            if effective_max_cycles < planned_min_cycles:
-                logging.info(
-                    f"Continuous task detected: override max_cycles {effective_max_cycles} -> {planned_min_cycles} "
-                    f"(min_cycles={min_cycles}, min_minutes={min_minutes}, est_cycle={avg_cycle_seconds:.1f}s)"
-                )
-                effective_max_cycles = planned_min_cycles
+            logging.info('Continuous task mode: ON')
 
-        logging.info("=" * 60)
-        logging.info(f"STARTING TASK: {user_request}")
-        if self.context['continuous_task']:
-            logging.info("Continuous task mode: ON")
-        logging.info("=" * 60)
+        plan, recovered_step_index, resumed = self._prepare_plan_and_recovery(user_request)
+        steps = plan.get('steps', [])
+        total_steps = len(steps)
+        if total_steps <= 0:
+            raise RuntimeError('Task planner produced empty steps')
 
-        retry_level, retry_budget = self._resolve_retry_budget(user_request)
+        self.context['task_plan'] = plan
+
         logging.info(
-            f"Retry budget resolved: level={retry_level}, budget={retry_budget}, cap={self.config.get('retry_budget_cap', 8)}"
+            f"Task plan ready: steps={total_steps}, resumed={resumed}, start_step={recovered_step_index + 1 if total_steps else 1}"
         )
 
-        cycles = 0
+        total_cycles = 0
         task_complete = False
         last_error = None
-        consecutive_failures = 0
 
-        while cycles < effective_max_cycles and not task_complete and not self.context.get('stop_requested', False):
-            cycles += 1
-            self.context['cycle_index'] = cycles
-            logging.info(f"\n--- Cycle {cycles}/{effective_max_cycles} ---")
-
-            try:
-                result = self.execute_cycle(user_request)
-
-                if result.get('task_complete'):
-                    task_complete = True
-                    logging.info("✓ Task marked complete by agent")
+        if recovered_step_index >= total_steps:
+            task_complete = True
+        else:
+            for idx in range(recovered_step_index, total_steps):
+                if self.context.get('stop_requested', False):
                     break
 
-                if not result['success']:
-                    last_error = result.get('error', 'Unknown error')
-                    failed_action = result.get('action') or result.get('planned_action') or {}
-                    retry_reason = self._classify_retry_reason(last_error, failed_action)
-                    result['retry_reason'] = retry_reason
-                    logging.warning(f"Action failed: reason={retry_reason}, error={last_error}")
+                self.current_step_index = idx
+                step = steps[idx]
+                step_key = str(idx)
+                step_name = str(step.get('step_name', f'Step {idx + 1}'))
+                instruction = str(step.get('instruction', '')).strip()
 
-                    # Failure feedback loop: re-screenshot -> classify -> ask model for corrected action
-                    corrected_result = self._run_failure_feedback_loop(
-                        user_request=user_request,
-                        failed_action=failed_action,
-                        failed_error=last_error,
-                        cycle_index=cycles,
+                current_status = self.step_status.get(step_key, 'pending')
+                if current_status == 'done':
+                    self.current_step_index = idx + 1
+                    continue
+
+                self.step_status[step_key] = 'in_progress'
+                self.context['current_step_name'] = step_name
+                self.context['current_step_instruction'] = instruction
+
+                logging.info('-' * 60)
+                logging.info(f"Executing {step_name} ({idx + 1}/{total_steps})")
+                logging.info(f"Instruction: {instruction}")
+
+                self._save_checkpoint(
+                    last_action=self.context.get('last_action'),
+                    last_screenshot=self.context.get('last_screenshot'),
+                )
+
+                step_prompt = self._build_step_prompt(user_request, step)
+                step_result = self._execute_step_cycles(step_prompt=step_prompt, max_cycles=max_cycles)
+                total_cycles += int(step_result.get('cycles', 0))
+                last_error = step_result.get('last_error', last_error)
+
+                if step_result.get('success'):
+                    self.step_status[step_key] = 'done'
+                    self.current_step_index = idx + 1
+                    self._save_checkpoint(
+                        last_action=step_result.get('last_action'),
+                        last_screenshot=step_result.get('last_screenshot'),
                     )
+                    logging.info(f"✓ Step completed: {step_name}")
+                    continue
 
-                    if corrected_result.get('task_complete'):
-                        task_complete = True
-                        logging.info("✓ Task completed during correction loop")
-                        break
-
-                    if corrected_result.get('success'):
-                        consecutive_failures = 0
-                        logging.info(
-                            f"Correction applied successfully (reason={corrected_result.get('retry_reason', retry_reason)})."
-                        )
-                    else:
-                        last_error = corrected_result.get('error', last_error)
-                        consecutive_failures += 1
-                        logging.warning(
-                            f"Correction failed (consecutive={consecutive_failures}/{retry_budget}): {last_error}"
-                        )
-                        if consecutive_failures >= retry_budget:
-                            logging.error(f"Max retries exceeded (budget={retry_budget})")
-                            break
-                else:
-                    consecutive_failures = 0
-
-            except KeyboardInterrupt:
-                logging.info("Task interrupted by user")
-                raise
-            except Exception as e:
-                last_error = str(e)
-                retry_reason = self._classify_retry_reason(last_error, None)
-                consecutive_failures += 1
-                logging.error(
-                    f"Cycle error (consecutive={consecutive_failures}/{retry_budget}, reason={retry_reason}): {e}"
+                self.step_status[step_key] = 'failed'
+                self.current_step_index = idx
+                fail_msg = last_error or f'Step failed: {step_name}'
+                self._save_checkpoint(
+                    last_action=step_result.get('last_action'),
+                    last_screenshot=step_result.get('last_screenshot'),
+                    last_error=fail_msg,
                 )
+                logging.error(f"✗ Step failed: {step_name}, error={fail_msg}")
+                break
 
-                if consecutive_failures >= retry_budget:
-                    logging.error(f"Max retries exceeded (budget={retry_budget})")
-                    break
+            task_complete = self.current_step_index >= total_steps
 
-                # Wait before retry
-                time.sleep(2)
-
-        # Final verification if we hit cycle budget.
-        if cycles >= effective_max_cycles and not task_complete and not self.context.get('stop_requested', False):
-            elapsed = max(0.0, time.time() - float(self.context.get('task_started_at') or time.time()))
-
-            # In continuous mode, reaching cycle budget with unmet time target should not be treated as failure.
-            if self.context.get('continuous_task') and min_minutes > 0 and elapsed < min_minutes * 60:
-                logging.info(
-                    f"Continuous run reached cycle budget before time target: elapsed={elapsed:.1f}s < {min_minutes*60:.1f}s"
-                )
-            else:
-                logging.info("Max cycles reached, checking if task is actually complete...")
-                screenshot_path = self.capture_screenshot()
-                completion_check = self.vl_agent.check_task_completion(
-                    screenshot_path,
-                    user_request,
-                    self.context
-                )
-                if completion_check.get('complete'):
-                    task_complete = True
-                    logging.info(f"✓ Task verified complete: {completion_check.get('reason')}")
-
-        # Summary
-        logging.info("\n" + "=" * 60)
+        logging.info("\n" + '=' * 60)
         if self.context.get('stop_requested', False):
-            logging.info(f"⏹ TASK STOPPED by user after {cycles} cycles")
+            logging.info(f"⏹ TASK STOPPED by user at step {self.current_step_index + 1}/{total_steps}")
             success = True
         elif task_complete:
-            logging.info(f"✓ TASK COMPLETED in {cycles} cycles")
+            logging.info(f"✓ TASK COMPLETED in {total_cycles} cycles ({total_steps} steps)")
             success = True
         elif self.context.get('continuous_task'):
-            # Continuous tasks are user-interrupt oriented; ending by budget is not a hard failure.
-            logging.info(f"ℹ CONTINUOUS TASK SESSION ENDED after {cycles} cycles")
+            logging.info(
+                f"ℹ CONTINUOUS TASK SESSION ENDED at step {self.current_step_index + 1}/{total_steps}, cycles={total_cycles}"
+            )
             if last_error:
                 logging.info(f"Last error: {last_error}")
             success = True
         else:
-            logging.info(f"✗ TASK INCOMPLETE after {cycles} cycles")
+            logging.info(
+                f"✗ TASK INCOMPLETE at step {self.current_step_index + 1}/{total_steps}, cycles={total_cycles}"
+            )
             if last_error:
                 logging.info(f"Last error: {last_error}")
             success = False
-        logging.info("=" * 60)
+        logging.info('=' * 60)
+
+        if task_complete:
+            self._clear_checkpoint()
 
         return {
             'success': success,
-            'cycles': cycles,
+            'cycles': total_cycles,
             'task_complete': task_complete,
             'context': self.context,
-            'screenshots': self.context['screenshots']
+            'screenshots': self.context['screenshots'],
+            'plan': self.current_plan,
+            'current_step_index': self.current_step_index,
+            'step_status': dict(self.step_status),
+            'checkpoint_path': self.current_checkpoint_path,
         }
 
 

@@ -74,7 +74,11 @@ def get_default_config():
         "retry_budget_simple": 2,
         "retry_budget_medium": 4,
         "retry_budget_complex": 6,
-        "retry_budget_cap": 8
+        "retry_budget_cap": 8,
+        "enable_task_planner": True,
+        "planner_max_steps": 8,
+        "enable_checkpoint_recovery": True,
+        "checkpoint_dir": "./checkpoints"
     }
 
 
