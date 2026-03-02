@@ -1,5 +1,8 @@
 # PhoneDriver
 
+> 本仓库基于上游项目二次开发：<https://github.com/OminousIndustries/PhoneDriver>  
+> 当前版本在上游基础上增加了稳定性、可观测性与中文化 Web 控制台能力。
+
 一个基于 Python 的 Android 自动化 Agent：通过 **Qwen3-VL** 理解手机截图，再用 **ADB** 执行动作（tap/swipe/type/system）。
 
 <p align="center">
@@ -243,5 +246,6 @@ Apache License 2.0（见 `LICENSE`）
 
 ## 致谢
 
+- 上游项目（fork base）：[OminousIndustries/PhoneDriver](https://github.com/OminousIndustries/PhoneDriver)
 - [Qwen3-VL](https://github.com/QwenLM/Qwen-VL)
 - [Gradio](https://gradio.app/)
