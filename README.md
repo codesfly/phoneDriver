@@ -1,188 +1,203 @@
-# Phone Driver
+# PhoneDriver
 
-A Python-based mobile automation agent that uses Qwen3-VL vision-language models to understand and interact with Android devices through visual analysis and ADB commands.
+一个基于 Python 的 Android 自动化 Agent：通过 **Qwen3-VL** 理解手机截图，再用 **ADB** 执行动作（tap/swipe/type/system）。
 
 <p align="center">
   <img src="Images/PhoneDriver.png" width="600" alt="Phone Driver Demo">
 </p>
 
-## Features
+---
 
-- 🤖 **Vision-powered automation**: Uses Qwen3-VL to visually understand phone screens
-- 📱 **ADB integration**: Controls Android devices via ADB commands
-- 🎯 **Natural language tasks**: Describe what you want in plain English
-- 🖥️ **Web UI**: Built-in Gradio interface for easy control
-- 📊 **Real-time feedback**: Live screenshots and execution logs
+## 功能特性
 
-## Requirements
+- 🤖 **视觉驱动自动化**：基于 Qwen3-VL 解析 UI
+- 📱 **ADB 控制**：执行点击、滑动、输入、系统按键
+- 🖥️ **Web UI**：内置 Gradio，可视化执行任务
+- 🔁 **连续任务支持**：可配置持续轮次/时长，避免过早 terminate
+- 🧭 **失败反馈闭环（Phase-1）**：失败后自动重截图、分类原因并请求修正动作
+- 📊 **可观测性增强**：记录 retry reason、修正决策、ADB stderr/stdout
+
+---
+
+## 环境要求
 
 - Python 3.10+
-- Android device with USB debugging & Developer Mode enabled
-- ADB (Android Debug Bridge) installed
-- GPU with sufficient VRAM (Tested on 24gb GPU with Qwen3-VL-8B Model)
-- The Repo is set to use the Dense Qwen3-VL 4B/8B Model which performs very well. To swap to an MoE model, see the configuration section below 
+- Android 设备（开启开发者模式与 USB/无线调试）
+- ADB（Android Debug Bridge）
+- 若使用本地模型：建议具备 GPU 显存
 
-## Installation
+---
 
-### 1. Install ADB
+## 安装步骤
 
-**Linux/Ubuntu:**
+### 1) 安装 ADB（Ubuntu）
+
 ```bash
 sudo apt update
-sudo apt install adb
+sudo apt install -y adb
 ```
-### 2. Clone Repo & Install Python Dependencies
+
+### 2) 克隆仓库并创建虚拟环境
 
 ```bash
-git clone https://github.com/OminousIndustries/PhoneDriver.git
-cd PhoneDriver
+git clone https://github.com/codesfly/phoneDriver.git
+cd phoneDriver
+python -m venv .venv
+source .venv/bin/activate
 ```
-Create a Virtual Enviornment
 
-```bash
-python -m venv phonedriver
-source phonedriver/bin/activate
-```
-Install Python Deps
+### 3) 安装依赖
 
 ```bash
 pip install git+https://github.com/huggingface/transformers
-# pip install transformers==4.57.0 # currently, V4.57.0 is not released
-
-# Install other requirements
-pip install pillow gradio qwen_vl_utils requests
+pip install pillow gradio qwen_vl_utils requests torch
 ```
 
-### 3. Connect Your Device
+---
 
-1. Enable USB debugging on your Android device (Settings → Developer Options)
-2. Connect via USB
-3. Verify connection:
+## 设备连接
+
+### USB 连接
+
 ```bash
 adb devices
 ```
-You should see your device listed.
 
-## Configuration
-
-### Model Selection
-
-Edit `qwen_vl_agent.py` to choose your model:
-
-```python
-# For 4B model
-model_name: str = "Qwen/Qwen3-VL-4B-Instruct"
-
-# For 8B model 
-#model_name: str = "Qwen/Qwen3-VL-8B-Instruct"
-```
-
-### If you want to try a Qwen3 MoE model, you need to change the import in `qwen_vl_agent.py` to the following:
-
-```python
-#from transformers import Qwen3VLForConditionalGeneration, AutoProcessor  - Comment this import out, it is for the Dense models
-# Uncomment the import below for the MoE Variants!!!
-from transformers import Qwen3VLMoeForConditionalGeneration, AutoProcessor
-```
-
-You will also need to change line 61: 
-
-```python
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-```
-Change it to:
-
-```python
-        self.model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-```
-
-### Screen Resolution
-
-The agent can auto-detect your device resolution from the Web UI settings tab, but you can manually configure it in `config.json`.
-
-```json
-{
-  "screen_width": 1080,
-  "screen_height": 2340,
-  ...
-}
-```
-
-To get your device resolution, with the device connected to your computer type the following in the terminal: 
-```bash
-adb shell wm size
-```
-
-## Usage
-
-### Web UI (Recommended)
-
-Launch the Gradio interface:
+### 无线调试连接
 
 ```bash
+adb connect <手机IP:端口>
+adb devices -l
+```
+
+> 提示：无线调试端口会变化，若连接失败请在手机上刷新后使用新端口。
+
+---
+
+## 快速启动
+
+### Web UI（推荐）
+
+```bash
+source .venv/bin/activate
 python ui.py
 ```
 
-Navigate to `http://localhost:7860` and enter tasks like:
-- "Open Chrome"
-- "Search for weather in New York"
-- "Open Settings and enable WiFi"
+打开：`http://localhost:7860`
 
-### Command Line
+### 命令行模式
 
 ```bash
-python phone_agent.py "your task here"
+source .venv/bin/activate
+python phone_agent.py "打开 TikTok 并刷一会视频"
 ```
 
-Example:
+---
+
+## 配置说明（`config.json`）
+
+常用配置项：
+
+- `device_id`: 设备 ID（如 `192.168.2.192:41527`），为空则自动探测
+- `screen_width` / `screen_height`: 分辨率
+- `step_delay`: 动作间隔秒数
+- `max_retries`: 基础重试上限
+- `adb_command_timeout`: 单条 ADB 命令超时（秒）
+
+### 远端 API 模式（推荐）
+
+- `use_remote_api`: `true/false`
+- `api_base_url`: OpenAI 兼容接口地址
+- `api_key`: API Key
+- `api_model`: 例如 `qwen3.5-plus`
+- `api_timeout`: API 超时秒数
+
+### 连续任务控制
+
+- `ignore_terminate_for_continuous_tasks`: 连续任务是否忽略早停 terminate
+- `continuous_min_cycles`: 连续任务最小轮次
+- `continuous_min_minutes`: 连续任务最小时长（分钟）
+
+### 动态重试预算（Phase-1）
+
+- `enable_dynamic_retry_budget`: 是否启用复杂度重试预算
+- `retry_budget_simple`: 简单任务预算（默认 2）
+- `retry_budget_medium`: 中等任务预算（默认 4）
+- `retry_budget_complex`: 复杂任务预算（默认 6）
+- `retry_budget_cap`: 预算上限（默认 8）
+
+---
+
+## 工作机制
+
+1. 截图：ADB 获取当前屏幕
+2. 视觉分析：Qwen3-VL 识别界面并给出动作
+3. 执行动作：tap/swipe/type/wait/system
+4. 失败闭环：失败时自动分类原因并请求修正动作
+5. 循环执行：直到完成、到达预算、或用户停止
+
+---
+
+## 故障排查
+
+### 1) 设备未连接
+
 ```bash
-python phone_agent.py "Open the camera app"
+adb kill-server
+adb start-server
+adb devices -l
 ```
 
-## How It Works
+### 2) 点击位置不准
 
-1. **Screenshot Capture**: Takes a screenshot of the phone via ADB
-2. **Visual Analysis**: Qwen3-VL analyzes the screen to understand UI elements
-3. **Action Planning**: Determines the best action to take (tap, swipe, type, etc.)
-4. **Execution**: Sends ADB commands to perform the action
-5. **Repeat**: Continues until task is complete or max cycles reached
+```bash
+adb -s <device_id> shell wm size
+```
 
-## Configuration Options
+同步更新 `config.json` 分辨率。
 
-Key settings in `config.json`:
+### 3) 模型无动作返回
 
-- `temperature`: Model creativity (0.0-1.0, default: 0.1)
-- `max_tokens`: Max response length (default: 512)
-- `step_delay`: Wait time between actions in seconds (default: 1.5)
-- `max_retries`: Maximum retry attempts (default: 3)
-- `use_flash_attention`: Enable Flash Attention 2 for faster inference
+查看 `phone_agent_ui.log` 是否出现：
+- `Remote API empty content`
+- `Failed to get action from model`
 
-## Troubleshooting
+当前代码已兼容 `tool_calls/content/reasoning_content` 三种形态。
 
-**Device not detected:**
-- Ensure USB debugging is enabled
-- Run `adb devices` to verify connection
-- Try `adb kill-server && adb start-server`
+### 4) 任务过早结束
 
-**Wrong tap locations:**
-- Auto-detect resolution in Settings tab of UI
-- Or manually verify with `adb shell wm size`
+提高：
+- `continuous_min_cycles`
+- 或 `continuous_min_minutes`
 
-**Model loading errors:**
-- Ensure you have sufficient VRAM
-- Try the 8B model for lower memory requirements
-- Check that transformers is installed from source
+并确认 `ignore_terminate_for_continuous_tasks=true`。
 
-**Out of memory:**
-- Use the 8B model instead of 30B
-- Reduce `max_tokens` in config
-- Close other applications using GPU memory
+---
+
+## 测试
+
+```bash
+source .venv/bin/activate
+python -m py_compile phone_agent.py qwen_vl_agent.py ui.py
+PYTHONPATH=. python tests/test_phase1_functions.py
+PYTHONPATH=. python tests/test_phase1_smoke.py
+```
+
+---
+
+## 提交与文档约定（本仓库）
+
+- 默认使用 **中文 commit message**
+- 默认使用 **中文 README/文档**（必要技术术语保留英文）
+- 变更提交前至少保证：`py_compile` 通过
+
+---
 
 ## License
 
-Apache License 2.0 - see LICENSE file for details
+Apache License 2.0（见 `LICENSE`）
 
-## Acknowledgments
+## 致谢
 
-- Built with [Qwen3-VL](https://github.com/QwenLM/Qwen-VL) by Alibaba Cloud
-- Uses [Gradio](https://gradio.app/) for the web interface
+- [Qwen3-VL](https://github.com/QwenLM/Qwen-VL)
+- [Gradio](https://gradio.app/)
