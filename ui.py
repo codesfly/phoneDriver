@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from threading import Thread
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import gradio as gr
 
 from phone_agent import PhoneAgent, parse_adb_devices_output, parse_wm_size_output
@@ -36,6 +36,100 @@ last_health_result = None
 TOS_NOTICE_TEXT = (
     "⚠️ 合规提醒：移动端自动化可能违反平台 TOS，仅限个人设备测试与合规场景。"
 )
+
+STEP_STATUS_LABELS = {
+    "pending": "待执行",
+    "running": "执行中",
+    "done": "已完成",
+    "failed": "失败",
+}
+
+STEP_STATUS_PROGRESS = {
+    "pending": "⬜",
+    "running": "🟡",
+    "done": "🟢",
+    "failed": "🔴",
+}
+
+PRESET_TASK_LIBRARY = {
+    "（不使用预设）": "",
+    "打开设置检查网络": "打开设置，然后进入网络与互联网页面，确认 Wi‑Fi 或移动网络可用",
+    "打开浏览器搜索天气": "打开浏览器，搜索上海天气，并停留在搜索结果页",
+    "进入应用并停留": "打开指定应用，进入首页后停留 10 秒，确认页面稳定",
+    "打开设置检查蓝牙": "打开设置，进入蓝牙页面，确认蓝牙开关状态",
+}
+
+
+def _normalize_step_status(raw_status: str) -> str:
+    status = str(raw_status or "").strip().lower()
+    if status in {"in_progress", "running"}:
+        return "running"
+    if status in {"done", "pending", "failed"}:
+        return status
+    return "pending"
+
+
+def format_task_tree_markdown(
+    plan: Optional[Dict[str, Any]],
+    step_status: Optional[Dict[str, Any]],
+    current_step_index: Optional[int],
+) -> str:
+    """Build markdown view for phase2 task tree.
+
+    Args:
+        plan: task plan from PhoneAgent.execute_task / context['task_plan']
+        step_status: step status dictionary
+        current_step_index: current active step index
+    """
+    if not plan or not isinstance(plan, dict):
+        return "### 🌲 任务树 / 规划步骤\n\n当前尚无任务规划。点击“开始任务”后会自动生成。"
+
+    steps = plan.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return "### 🌲 任务树 / 规划步骤\n\n当前任务没有可展示的步骤。"
+
+    try:
+        active_index = int(current_step_index or 0)
+    except Exception:
+        active_index = 0
+
+    lines: List[str] = ["### 🌲 任务树 / 规划步骤", ""]
+    lines.append(f"- 总步骤数：{len(steps)}")
+    lines.append(f"- 当前步骤索引：{active_index + 1}")
+    lines.append("")
+
+    status_map = step_status if isinstance(step_status, dict) else {}
+
+    for idx, step in enumerate(steps):
+        item = step if isinstance(step, dict) else {}
+        step_name = str(item.get("step_name", f"Step {idx + 1}")).strip() or f"Step {idx + 1}"
+        instruction = str(item.get("instruction", "")).strip() or "（无）"
+        success = str(item.get("success_criteria", "")).strip() or "（无）"
+
+        status = _normalize_step_status(status_map.get(str(idx), "pending"))
+        if status == "pending" and idx == active_index:
+            status = "running"
+        status_label = STEP_STATUS_LABELS.get(status, "待执行")
+        status_icon = STEP_STATUS_PROGRESS.get(status, "⬜")
+
+        lines.append(f"{idx + 1}. {status_icon} **{step_name}**  `[{status_label}]`")
+        lines.append(f"   - instruction: {instruction}")
+        lines.append(f"   - success_criteria: {success}")
+
+    return "\n".join(lines)
+
+
+def apply_preset_task(preset_name: str, current_text: str) -> Tuple[str, str]:
+    """Return task textbox content + status message for preset selection."""
+    selected = str(preset_name or "").strip()
+    if selected not in PRESET_TASK_LIBRARY:
+        return current_text or "", "⚠️ 未识别的预设任务"
+
+    preset_text = PRESET_TASK_LIBRARY[selected]
+    if not preset_text:
+        return current_text or "", "已取消预设，保留当前输入"
+
+    return preset_text, f"✓ 已应用预设任务：{selected}"
 
 
 def load_config(config_path="config.json"):
@@ -334,21 +428,25 @@ def execute_task_thread(task, max_cycles, config):
 def start_task(task, max_cycles, config_json):
     """Start a task execution."""
     global is_running, current_config
-    
+
+    waiting_tree = "### 🌲 任务树 / 规划步骤\n\n任务已启动，正在生成规划步骤..."
+
     if is_running:
         return (
             "⚠️ 当前已有任务在运行",
             None,
-            gr.update(active=False)
+            gr.update(active=False),
+            waiting_tree,
         )
-    
+
     if not task.strip():
         return (
             "✗ 请输入任务描述",
             None,
-            gr.update(active=False)
+            gr.update(active=False),
+            format_task_tree_markdown(None, None, None),
         )
-    
+
     try:
         config = json.loads(config_json)
         current_config = config
@@ -356,40 +454,54 @@ def start_task(task, max_cycles, config_json):
         return (
             f"✗ 配置 JSON 无效: {e}",
             None,
-            gr.update(active=False)
+            gr.update(active=False),
+            format_task_tree_markdown(None, None, None),
         )
-    
+
     try:
         max_cycles = int(max_cycles)
         if max_cycles < 1:
             max_cycles = 15
     except ValueError:
         max_cycles = 15
-    
+
     thread = Thread(target=execute_task_thread, args=(task, max_cycles, config))
     thread.daemon = True
     thread.start()
-    
+
     return (
         "✓ 任务已启动...",
         None,
-        gr.update(active=True)
+        gr.update(active=True),
+        waiting_tree,
     )
 
 
 def update_ui():
-    """Update UI with latest screenshot and logs."""
-    global current_screenshot, log_handler, is_running
-    
+    """Update UI with latest screenshot, logs, and task tree."""
+    global current_screenshot, log_handler, is_running, agent
+
     screenshot = None
     if current_screenshot and os.path.exists(current_screenshot):
         screenshot = current_screenshot
-    
+
     logs = "\n".join(log_handler.logs) if log_handler else ""
-    
+
+    plan = None
+    step_status = None
+    current_step_index = None
+    if agent is not None:
+        try:
+            plan = getattr(agent, "current_plan", None) or agent.context.get("task_plan")
+            step_status = getattr(agent, "step_status", None)
+            current_step_index = getattr(agent, "current_step_index", 0)
+        except Exception as e:
+            logging.error(f"刷新任务树失败: {e}")
+
+    task_tree_markdown = format_task_tree_markdown(plan, step_status, current_step_index)
     timer_state = gr.update(active=is_running)
-    
-    return (screenshot, logs, timer_state)
+
+    return (screenshot, logs, timer_state, task_tree_markdown)
 
 
 def stop_task():
@@ -501,12 +613,25 @@ def create_ui():
             with gr.Tab("🎯 任务控制"):
                 with gr.Row():
                     with gr.Column(scale=2):
+                        preset_task = gr.Dropdown(
+                            label="预设任务",
+                            choices=list(PRESET_TASK_LIBRARY.keys()),
+                            value="（不使用预设）",
+                        )
+
                         task_input = gr.Textbox(
                             label="任务描述",
                             placeholder="例如：打开浏览器并搜索上海天气",
                             lines=3
                         )
-                        
+
+                        preset_status = gr.Textbox(
+                            label="预设状态",
+                            value="可从上方下拉选择预设任务，一键填充任务描述。",
+                            interactive=False,
+                            lines=1,
+                        )
+
                         with gr.Row():
                             max_cycles = gr.Number(
                                 label="最大轮次",
@@ -516,14 +641,19 @@ def create_ui():
                             )
                             start_btn = gr.Button("▶️ 开始任务", variant="primary", scale=2)
                             stop_btn = gr.Button("⏹️ 停止", variant="stop", scale=1)
-                        
+
                         status_text = gr.Textbox(label="状态", lines=2, interactive=False)
-                    
+
                     with gr.Column(scale=3):
                         image_output = gr.Image(
                             label="当前屏幕",
                             type="filepath",
-                            height=600
+                            height=520
+                        )
+
+                        task_tree_output = gr.Markdown(
+                            value=format_task_tree_markdown(None, None, None),
+                            elem_id="task-tree-panel",
                         )
                 
                 log_output = gr.Textbox(
@@ -641,43 +771,65 @@ def create_ui():
 
 1. **连接设备**：开启 USB 调试，连接设备
 2. **配置分辨率**：在“设置”页点击自动检测
-3. **运行任务**：输入任务描述并点击“开始任务”
+3. **选择预设（可选）**：在“任务控制”页选择预设任务，一键填充输入框
+4. **运行任务**：检查任务描述并点击“开始任务”
+
+## 任务树如何理解
+- 右侧“任务树 / 规划步骤”会展示 phase2 生成的步骤清单。
+- 每个步骤包含：`step_name`（步骤名）、`instruction`（执行指令）、`success_criteria`（成功标准）。
+- 状态说明：
+  - ⬜ 待执行
+  - 🟡 执行中
+  - 🟢 已完成
+  - 🔴 失败
+- “当前步骤索引”表示当前正在执行（或最后一次停留）的步骤位置。
+
+## 预设任务如何使用
+- 在“预设任务”下拉选择一个场景，会自动填充“任务描述”。
+- 若选择“（不使用预设）”，将保留当前输入内容。
+- 建议先用预设验证环境连通，再改成自定义任务。
 
 ## 任务示例
-- “打开浏览器”
-- “搜索上海天气”
-- “打开设置并启用无线网络”
+- “打开浏览器并搜索上海天气”
+- “打开设置检查网络连接”
+- “进入应用并停留 10 秒”
 
 ## 故障排查
-- **点击不准**：检查设置里的分辨率
+- **点击不准**：检查设置页的分辨率是否与真机一致
 - **找不到设备**：在终端执行 `adb devices`
-- **执行报错**：查看“执行日志”
+- **执行报错**：查看“执行日志”与“任务树”中的失败步骤
                 """)
         
         timer = gr.Timer(value=3, active=False)
         
         # Event handlers
+        preset_task.change(
+            fn=apply_preset_task,
+            inputs=[preset_task, task_input],
+            outputs=[task_input, preset_status],
+        )
+
         start_btn.click(
             fn=start_task,
             inputs=[task_input, max_cycles, config_editor],
-            outputs=[status_text, image_output, timer]
+            outputs=[status_text, image_output, timer, task_tree_output]
         )
-        
+
         stop_btn.click(
             fn=stop_task,
             outputs=status_text
         )
-        
+
         timer.tick(
             fn=update_ui,
-            outputs=[image_output, log_output, timer]
+            outputs=[image_output, log_output, timer, task_tree_output]
         )
-        
+
         refresh_btn.click(
             fn=update_ui,
-            outputs=[image_output, log_output, timer]
+            outputs=[image_output, log_output, timer, task_tree_output]
         )
-        
+
         clear_logs_btn.click(
             fn=clear_logs_fn,
             outputs=log_output

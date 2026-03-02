@@ -18,6 +18,8 @@
 - ⚡ **快速截屏 + 回退机制（P0）**：默认 `adb exec-out screencap -p`，失败显式回退 legacy 路径
 - 🩺 **启动健康检测（P0）**：自动检测 ADB/设备连接/分辨率，支持 UI 一键刷新
 - 📊 **可观测性增强**：记录 retry reason、修正决策、ADB stderr/stdout、截屏路径模式
+- 🌲 **任务树可视化（P1）**：展示 phase2 规划步骤与实时步骤状态（pending/running/done/failed）
+- 🧩 **预设任务库（P1）**：中文预设任务一键填充输入框，便于快速验证环境
 
 ---
 
@@ -132,6 +134,29 @@ python phone_agent.py "打开 TikTok 并刷一会视频"
 
 ---
 
+## UI：任务树与预设任务（P1）
+
+### 任务树如何理解
+
+- 在“任务控制”页右侧可看到“任务树 / 规划步骤”面板。
+- 该面板展示 phase2 任务分解后的步骤清单：
+  - `step_name`：步骤名
+  - `instruction`：执行指令
+  - `success_criteria`：成功标准
+- 状态标识：
+  - `⬜ pending`（待执行）
+  - `🟡 running`（执行中）
+  - `🟢 done`（已完成）
+  - `🔴 failed`（失败）
+- “当前步骤索引”会随任务执行实时刷新。
+
+### 预设任务如何使用
+
+- 在“任务控制”页选择“预设任务”下拉。
+- 选中预设后会自动填充“任务描述”输入框。
+- 若选择“（不使用预设）”，保留当前输入，不覆盖文本。
+- 预设任务均为通用合规场景，可作为连通性自检起点。
+
 ## 工作机制
 
 1. 截图：ADB 获取当前屏幕
@@ -185,6 +210,8 @@ source .venv/bin/activate
 python -m py_compile phone_agent.py qwen_vl_agent.py ui.py
 PYTHONPATH=. python tests/test_phase1_functions.py
 PYTHONPATH=. python tests/test_phase1_smoke.py
+PYTHONPATH=. python tests/test_p1_functions.py
+PYTHONPATH=. python tests/test_p1_ui_smoke.py
 ```
 
 ---
