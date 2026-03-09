@@ -120,13 +120,26 @@ Rules:
     @staticmethod
     def _load_openclaw_bailian_defaults() -> Dict[str, Optional[str]]:
         """Load qwen-plus-style defaults from local OpenClaw config if present."""
-        candidates = [
-            Path("/home/jiumu/.openclaw/openclaw.json"),
-            Path(os.environ.get("OPENCLOW_CONFIG", "")),
+        config_candidates = [
+            os.environ.get("OPENCLAW_CONFIG", ""),
+            os.environ.get("OPENCLOW_CONFIG", ""),  # backward-compatible typo fallback
+            str(Path.home() / ".openclaw" / "openclaw.json"),
         ]
 
+        candidates = []
+        seen = set()
+        for raw in config_candidates:
+            if not raw or not str(raw).strip():
+                continue
+            path = Path(raw).expanduser()
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(path)
+
         for path in candidates:
-            if not path or not str(path).strip() or not path.exists():
+            if not path.exists():
                 continue
             try:
                 data = json.loads(path.read_text())
