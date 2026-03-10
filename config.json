@@ -31,5 +31,19 @@
   "checkpoint_dir": "./checkpoints",
   "enable_exception_handler": true,
   "hitl_on_captcha": true,
-  "exception_network_backoff_ms": 2000
+  "exception_network_backoff_ms": 2000,
+  "platform": "android",
+  "ios_enabled": false,
+  "ios_default_udid": "",
+  "ios_go_ios_binary": "go-ios",
+  "ios_wda_base_url": "http://127.0.0.1:8100",
+  "ios_command_timeout": 20,
+  "ios_auto_start_tunnel": true,
+  "ios_auto_start_runwda": true,
+  "ios_wda_ready_timeout": 40,
+  "ios_wda_ready_interval": 1.5,
+  "ios_health_check_ensure_session": true,
+  "ios_logs_dir": "./logs",
+  "ios_tunnel_command": "",
+  "ios_runwda_command": ""
 }

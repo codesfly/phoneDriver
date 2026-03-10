@@ -15,6 +15,8 @@
 
 - 🤖 **视觉驱动自动化**：基于 Qwen3-VL 解析 UI
 - 📱 **ADB 控制**：执行点击、滑动、输入、系统按键
+- 🍎 **iOS Bridge Phase-2（macOS）**：通过 go-ios + WDA 提供自动 tunnel/runwda/WDA readiness/session 管理，以及截图、tap/swipe/type/source、launch/terminate app
+- 🌐 **iOS 最小 HTTP API**：在保留 Gradio UI 的同时，提供 `/ios/<action>` 可复用服务接口
 - 🖥️ **Web UI**：内置 Gradio，可视化执行任务
 - 🔁 **连续任务支持**：可配置持续轮次/时长，避免过早 terminate
 - 🧭 **失败反馈闭环（Phase-1）**：失败后自动重截图、分类原因并请求修正动作
@@ -99,6 +101,50 @@ source .venv/bin/activate
 python phone_agent.py "打开 TikTok 并刷一会视频"
 ```
 
+### iOS Bridge Phase-2（macOS）
+
+> 不使用 Appium；仅使用 `go-ios + WDA`。新增自动 tunnel/runwda/WDA readiness/session 管理。  
+> Debug-first：非 macOS、无 go-ios、设备未连、WDA 未就绪、命令失败都会显式报错，不会“假成功”。
+
+1) 安装并验证 go-ios（示例）
+```bash
+go-ios list
+```
+
+2) 打开 `config.json` 并显式开启（最小必需）
+```json
+{
+  "ios_enabled": true,
+  "ios_default_udid": "<你的UDID>",
+  "ios_go_ios_binary": "go-ios",
+  "ios_wda_base_url": "http://127.0.0.1:8100",
+  "ios_auto_start_tunnel": true,
+  "ios_auto_start_runwda": true,
+  "ios_wda_ready_timeout": 40
+}
+```
+
+3) 启动 Web UI，进入 `🍎 iOS Bridge` 标签页
+- 推荐先点：`🧰 一键准备 (tunnel+runwda+session)`
+- 再执行：健康检查 / 截图 / tap / swipe / type / source / launch / terminate
+
+4) 可选：启动最小 HTTP API（供 UI 外调用）
+```bash
+source .venv/bin/activate
+python ios_http_api.py --host 127.0.0.1 --port 8787 --config config.json
+```
+
+示例调用：
+```bash
+curl -s http://127.0.0.1:8787/health | jq .
+curl -s -X POST http://127.0.0.1:8787/ios/prepare \
+  -H 'Content-Type: application/json' \
+  -d '{"udid":"<你的UDID>","ensure_session":true}' | jq .
+curl -s -X POST http://127.0.0.1:8787/ios/screenshot \
+  -H 'Content-Type: application/json' \
+  -d '{"udid":"<你的UDID>"}' | jq .
+```
+
 ---
 
 ## 配置说明（`config.json`）
@@ -134,6 +180,27 @@ python phone_agent.py "打开 TikTok 并刷一会视频"
 - `retry_budget_medium`: 中等任务预算（默认 4）
 - `retry_budget_complex`: 复杂任务预算（默认 6）
 - `retry_budget_cap`: 预算上限（默认 8）
+
+### iOS Bridge Phase-2 配置（macOS）
+
+- `ios_enabled`: 是否启用 iOS bridge（默认 `false`，必须显式开启）
+- `ios_default_udid`: 默认 iOS 设备 UDID（也可在 UI/API 调用时临时传）
+- `ios_go_ios_binary`: go-ios 命令名/路径（默认 `go-ios`）
+- `ios_wda_base_url`: WDA 地址（默认 `http://127.0.0.1:8100`）
+- `ios_command_timeout`: iOS 命令超时秒数
+- `ios_auto_start_tunnel`: WDA 不可达时是否自动拉起 tunnel（默认 `true`）
+- `ios_auto_start_runwda`: WDA 不可达时是否自动拉起 runwda（默认 `true`）
+- `ios_wda_ready_timeout`: 等待 WDA 就绪超时秒数（默认 `40`）
+- `ios_wda_ready_interval`: readiness 轮询间隔秒（默认 `1.5`）
+- `ios_health_check_ensure_session`: 健康检查是否顺带建立 session（默认 `true`）
+- `ios_logs_dir`: iOS 子进程日志目录（默认 `./logs`）
+- `ios_tunnel_command`: tunnel 启动命令模板（可选，留空用内置默认）
+- `ios_runwda_command`: runwda 启动命令模板（可选，留空用内置默认）
+
+命令模板支持占位符：`{go_ios}` / `{udid}` / `{host}` / `{port}`。  
+例如 `ios_tunnel_command` 可写为：`"{go_ios} tunnel --udid {udid}"`。
+
+> Debug-first：若未在 macOS、未安装 go-ios、UDID 不可用、tunnel/runwda 启动失败、WDA readiness 超时、session 创建失败，都会显式抛错并带日志尾部，不会“假成功”。
 
 ---
 
@@ -210,11 +277,12 @@ adb -s <device_id> shell wm size
 
 ```bash
 source .venv/bin/activate
-python -m py_compile phone_agent.py qwen_vl_agent.py ui.py
+python -m py_compile phone_agent.py qwen_vl_agent.py ui.py ios_bridge.py ios_service.py ios_http_api.py
 PYTHONPATH=. python tests/test_phase1_functions.py
 PYTHONPATH=. python tests/test_phase1_smoke.py
 PYTHONPATH=. python tests/test_p1_functions.py
 PYTHONPATH=. python tests/test_p1_ui_smoke.py
+PYTHONPATH=. python tests/test_ios_bridge_minimal.py
 ```
 
 ---

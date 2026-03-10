@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import gradio as gr
 
 from phone_agent import PhoneAgent, parse_adb_devices_output, parse_wm_size_output
+from ios_service import IOSBridgeService, IOSServiceError
 
 
 class UILogHandler(logging.Handler):
@@ -184,7 +185,21 @@ def get_default_config():
         "checkpoint_dir": "./checkpoints",
         "enable_exception_handler": True,
         "hitl_on_captcha": True,
-        "exception_network_backoff_ms": 2000
+        "exception_network_backoff_ms": 2000,
+        "platform": "android",
+        "ios_enabled": False,
+        "ios_default_udid": "",
+        "ios_go_ios_binary": "go-ios",
+        "ios_wda_base_url": "http://127.0.0.1:8100",
+        "ios_command_timeout": 20,
+        "ios_auto_start_tunnel": True,
+        "ios_auto_start_runwda": True,
+        "ios_wda_ready_timeout": 40,
+        "ios_wda_ready_interval": 1.5,
+        "ios_health_check_ensure_session": True,
+        "ios_logs_dir": "./logs",
+        "ios_tunnel_command": "",
+        "ios_runwda_command": ""
     }
 
 
@@ -593,6 +608,125 @@ def clear_logs_fn():
     return ""
 
 
+def _ios_service_from_config(cfg: Optional[Dict[str, Any]] = None) -> IOSBridgeService:
+    return IOSBridgeService.from_config(cfg or current_config or load_config())
+
+
+def ios_discover_devices_ui(config_json: str):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("discover", {})
+        return json.dumps(result.get("devices", []), indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS 设备发现失败: {e}"
+
+
+def ios_prepare_ui(config_json: str, udid: str):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("prepare", {"udid": udid or None, "ensure_session": True})
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS 准备失败: {e}"
+
+
+def ios_health_check_ui(config_json: str, udid: str):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("health", {"udid": udid or None})
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS 健康检查失败: {e}"
+
+
+def ios_screenshot_ui(config_json: str, udid: str):
+    global current_screenshot
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("screenshot", {"udid": udid or None})
+        shot = str(result.get("path") or "")
+        if not shot:
+            return None, "✗ iOS 截图失败: 服务未返回截图路径"
+        current_screenshot = shot
+        return shot, f"✓ iOS 截图成功: {shot}"
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return None, f"✗ iOS 截图失败: {e}"
+
+
+def ios_tap_ui(config_json: str, udid: str, x: int, y: int):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("tap", {"udid": udid or None, "x": int(x), "y": int(y)})
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS tap 失败: {e}"
+
+
+def ios_swipe_ui(config_json: str, udid: str, x1: int, y1: int, x2: int, y2: int, duration: float):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call(
+            "swipe",
+            {
+                "udid": udid or None,
+                "x1": int(x1),
+                "y1": int(y1),
+                "x2": int(x2),
+                "y2": int(y2),
+                "duration": float(duration),
+            },
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS swipe 失败: {e}"
+
+
+def ios_type_ui(config_json: str, udid: str, text: str):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("type", {"udid": udid or None, "text": text})
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS type 失败: {e}"
+
+
+def ios_source_ui(config_json: str, udid: str):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("source", {"udid": udid or None})
+        return result.get("source", "")
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS source 失败: {e}"
+
+
+def ios_launch_app_ui(config_json: str, udid: str, bundle_id: str):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("launch", {"udid": udid or None, "bundle_id": bundle_id})
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS launch 失败: {e}"
+
+
+def ios_terminate_app_ui(config_json: str, udid: str, bundle_id: str):
+    try:
+        cfg = json.loads(config_json)
+        service = _ios_service_from_config(cfg)
+        result = service.call("terminate", {"udid": udid or None, "bundle_id": bundle_id})
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, IOSServiceError, Exception) as e:
+        return f"✗ iOS terminate 失败: {e}"
+
+
 def create_ui():
     """Create the Gradio interface."""
     global current_config, last_health_result
@@ -765,6 +899,50 @@ def create_ui():
                     lines=15
                 )
             
+            with gr.Tab("🍎 iOS Bridge"):
+                gr.Markdown("### iOS 最小可用桥接（macOS + go-ios + WDA）")
+                gr.Markdown("- 仅支持 macOS（Darwin）\n- 需要本机可执行 `go-ios`\n- 可自动拉起 tunnel / runwda，并等待 WDA readiness\n- 支持 session 自动创建与复用\n- Debug-first：环境未就绪会显式报错，不会假成功")
+
+                with gr.Row():
+                    ios_udid = gr.Textbox(
+                        label="iOS UDID（可选，留空使用 config.ios_default_udid）",
+                        value=current_config.get("ios_default_udid", ""),
+                    )
+                    ios_bundle_id = gr.Textbox(
+                        label="Bundle ID（用于 launch/terminate）",
+                        placeholder="例如：com.apple.Preferences",
+                        value="",
+                    )
+
+                with gr.Row():
+                    ios_discover_btn = gr.Button("🔎 发现设备 (go-ios list)")
+                    ios_prepare_btn = gr.Button("🧰 一键准备 (tunnel+runwda+session)")
+                    ios_health_btn = gr.Button("🩺 健康检查 (go-ios + WDA)")
+                    ios_screenshot_btn = gr.Button("📸 iOS 截图")
+                    ios_source_btn = gr.Button("📄 获取 UI Source")
+
+                with gr.Row():
+                    ios_tap_x = gr.Number(label="tap X", value=200)
+                    ios_tap_y = gr.Number(label="tap Y", value=300)
+                    ios_tap_btn = gr.Button("👆 Tap")
+
+                with gr.Row():
+                    ios_swipe_x1 = gr.Number(label="swipe X1", value=300)
+                    ios_swipe_y1 = gr.Number(label="swipe Y1", value=1200)
+                    ios_swipe_x2 = gr.Number(label="swipe X2", value=300)
+                    ios_swipe_y2 = gr.Number(label="swipe Y2", value=400)
+                    ios_swipe_duration = gr.Number(label="duration(s)", value=0.2)
+                    ios_swipe_btn = gr.Button("↕️ Swipe")
+
+                with gr.Row():
+                    ios_type_text = gr.Textbox(label="输入文本", value="hello")
+                    ios_type_btn = gr.Button("⌨️ Type")
+                    ios_launch_btn = gr.Button("🚀 Launch App")
+                    ios_terminate_btn = gr.Button("🛑 Terminate App")
+
+                ios_image_output = gr.Image(label="iOS 当前截图", type="filepath", height=420)
+                ios_result_output = gr.Textbox(label="iOS 输出", lines=14, max_lines=20, interactive=False)
+
             with gr.Tab("❓ 帮助"):
                 gr.Markdown("""
 ## 快速开始
@@ -861,6 +1039,74 @@ def create_ui():
                 continuous_min_minutes,
             ],
             outputs=[settings_status, config_editor]
+        )
+
+        ios_discover_btn.click(
+            fn=ios_discover_devices_ui,
+            inputs=[config_editor],
+            outputs=[ios_result_output],
+        )
+
+        ios_prepare_btn.click(
+            fn=ios_prepare_ui,
+            inputs=[config_editor, ios_udid],
+            outputs=[ios_result_output],
+        )
+
+        ios_health_btn.click(
+            fn=ios_health_check_ui,
+            inputs=[config_editor, ios_udid],
+            outputs=[ios_result_output],
+        )
+
+        ios_screenshot_btn.click(
+            fn=ios_screenshot_ui,
+            inputs=[config_editor, ios_udid],
+            outputs=[ios_image_output, ios_result_output],
+        )
+
+        ios_source_btn.click(
+            fn=ios_source_ui,
+            inputs=[config_editor, ios_udid],
+            outputs=[ios_result_output],
+        )
+
+        ios_tap_btn.click(
+            fn=ios_tap_ui,
+            inputs=[config_editor, ios_udid, ios_tap_x, ios_tap_y],
+            outputs=[ios_result_output],
+        )
+
+        ios_swipe_btn.click(
+            fn=ios_swipe_ui,
+            inputs=[
+                config_editor,
+                ios_udid,
+                ios_swipe_x1,
+                ios_swipe_y1,
+                ios_swipe_x2,
+                ios_swipe_y2,
+                ios_swipe_duration,
+            ],
+            outputs=[ios_result_output],
+        )
+
+        ios_type_btn.click(
+            fn=ios_type_ui,
+            inputs=[config_editor, ios_udid, ios_type_text],
+            outputs=[ios_result_output],
+        )
+
+        ios_launch_btn.click(
+            fn=ios_launch_app_ui,
+            inputs=[config_editor, ios_udid, ios_bundle_id],
+            outputs=[ios_result_output],
+        )
+
+        ios_terminate_btn.click(
+            fn=ios_terminate_app_ui,
+            inputs=[config_editor, ios_udid, ios_bundle_id],
+            outputs=[ios_result_output],
         )
     
     return demo
