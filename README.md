@@ -50,7 +50,9 @@
 - Python 3.10+
 - Android 设备（开启开发者模式与 USB/无线调试）
 - ADB（Android Debug Bridge）
-- 若使用本地模型：建议具备 GPU 显存
+- **模型支持双端配置 (Local & Remote)**：
+  - **本地运行**: 需要具备足够显存的 GPU 支撑 Qwen-VL 本地推理。
+  - **云端接入**: 支持使用各大平台的兼容 API Endpoint (如阿里云百炼、硅基流动等) 一键无缝调用云端大模型，无需本地显卡。
 
 ---
 
