@@ -222,6 +222,7 @@ Rules:
         user_request: str,
         context: Optional[Dict[str, Any]] = None,
         retry_feedback: Optional[Dict[str, Any]] = None,
+        ui_context: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Analyze a phone screenshot and determine the next action."""
         try:
@@ -250,6 +251,20 @@ Rules:
             # Build user query in official format
             user_query = f"""The user query: {user_request}.
 Task progress (You have done the following operation on the current device): {history_str}."""
+
+            if ui_context:
+                simplified_ui = []
+                for node in ui_context:
+                    sn = {}
+                    if node.get('text'): sn['text'] = node['text']
+                    if node.get('content_desc'): sn['desc'] = node['content_desc']
+                    sn['center'] = [node.get('center_x'), node.get('center_y')]
+                    simplified_ui.append(sn)
+                    
+                ui_str = json.dumps(simplified_ui, ensure_ascii=False)
+                if len(ui_str) > 4000:
+                    ui_str = ui_str[:3997] + "..."
+                user_query += f"\n\nActive UI Elements Context (Reference these exact center coordinates for precise click/swipe): {ui_str}"
 
             if retry_feedback:
                 retry_reason = retry_feedback.get("retry_reason", "未知")

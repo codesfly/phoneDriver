@@ -64,7 +64,7 @@ class Phase3SmokeTest(unittest.TestCase):
         agent.current_checkpoint_path = None
 
         class DummyVL:
-            def analyze_screenshot(self, screenshot_path, user_request, context, retry_feedback=None):
+            def analyze_screenshot(self, screenshot_path, user_request, context, retry_feedback=None, **kwargs):
                 return {
                     "action": "wait",
                     "waitTime": 300,

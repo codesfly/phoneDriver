@@ -50,7 +50,7 @@ class Phase1SmokeTest(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def analyze_screenshot(self, screenshot_path, user_request, context, retry_feedback=None):
+            def analyze_screenshot(self, screenshot_path, user_request, context, retry_feedback=None, **kwargs):
                 self.calls += 1
                 if retry_feedback is None:
                     return {"action": "tap", "coordinates": [0.5, 0.5], "observation": "tap center"}

@@ -1,0 +1,16 @@
+{
+  "task_name": "打开相机",
+  "steps": [
+    {
+      "fingerprint": "empty_ui_tree",
+      "action": {
+        "action": "wait",
+        "waitTime": 10,
+        "observation": "wait for load"
+      },
+      "expected_result": {
+        "success": true
+      }
+    }
+  ]
+}

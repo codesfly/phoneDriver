@@ -550,6 +550,8 @@ def apply_settings(
     use_fa2,
     visual_debug,
     use_fast_screencap,
+    enable_ui_tree_injection,
+    enable_smart_replay,
     ignore_terminate_continuous,
     continuous_min_cycles,
     continuous_min_minutes,
@@ -568,6 +570,8 @@ def apply_settings(
         config['use_flash_attention'] = use_fa2
         config['enable_visual_debug'] = visual_debug
         config['use_fast_screencap'] = bool(use_fast_screencap)
+        config['enable_ui_tree_injection'] = bool(enable_ui_tree_injection)
+        config['enable_smart_replay'] = bool(enable_smart_replay)
 
         config['ignore_terminate_for_continuous_tasks'] = bool(ignore_terminate_continuous)
         config['continuous_min_cycles'] = max(1, int(continuous_min_cycles))
@@ -962,7 +966,7 @@ def create_ui():
         button_secondary_border_color="#30363d",
     )
 
-    with gr.Blocks(title="PhoneDriver Dashboard", theme=dark_theme, css=CUSTOM_CSS) as demo:
+    with gr.Blocks(title="PhoneDriver Dashboard") as demo:
 
         # ── Top header bar ──────────────────────────────────────
         with gr.Group(elem_id="header-bar"):
@@ -1047,7 +1051,6 @@ def create_ui():
                     lines=14,
                     max_lines=20,
                     interactive=False,
-                    show_copy_button=True,
                     show_label=False,
                     elem_id="log-panel",
                 )
@@ -1122,6 +1125,16 @@ def create_ui():
                     use_fast_screencap = gr.Checkbox(
                         label="快速截图 (exec-out)",
                         value=current_config.get('use_fast_screencap', True),
+                    )
+                    enable_ui_tree_injection = gr.Checkbox(
+                        label="融合 UI 树增强定位",
+                        info="拉取原生 UI 树进行极高精度元素点击对齐（会稍微增加单步延迟）",
+                        value=current_config.get('enable_ui_tree_injection', True),
+                    )
+                    enable_smart_replay = gr.Checkbox(
+                        label="启用轨迹录制与回放",
+                        info="命中相同任务与相似界面时绕过模型直发操作，大幅降本提速",
+                        value=current_config.get('enable_smart_replay', True),
                     )
                     gr.Markdown("#### 连续任务")
                     ignore_terminate_continuous = gr.Checkbox(
@@ -1282,6 +1295,7 @@ def create_ui():
                 screen_width, screen_height,
                 temperature, max_tokens, step_delay,
                 use_flash_attn, visual_debug, use_fast_screencap,
+                enable_ui_tree_injection, enable_smart_replay,
                 ignore_terminate_continuous,
                 continuous_min_cycles, continuous_min_minutes,
             ],
@@ -1368,6 +1382,8 @@ def main():
         server_port=7860,
         share=False,
         show_error=True,
+        theme=dark_theme,
+        css=CUSTOM_CSS,
     )
 
 

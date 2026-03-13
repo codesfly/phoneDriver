@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
 from qwen_vl_agent import QwenVLAgent
+from replay_engine import ReplayEngine
 
 
 def parse_wm_size_output(raw_output: str) -> Optional[Tuple[int, int]]:
@@ -245,8 +246,12 @@ class PhoneAgent:
             self.config['adb_command_timeout'] = 15
 
         self.config['use_fast_screencap'] = bool(self.config.get('use_fast_screencap', True))
+        self.config['enable_smart_replay'] = bool(self.config.get('enable_smart_replay', True))
         runtime_config_path = str(self.config.get('runtime_config_path', 'config.json') or 'config.json').strip()
         self.config['runtime_config_path'] = runtime_config_path or 'config.json'
+
+        if not hasattr(self, 'replay_engine'):
+            self.replay_engine = ReplayEngine(records_dir=self.config.get('records_dir', 'records'))
 
         self.config['enable_dynamic_retry_budget'] = bool(self.config.get('enable_dynamic_retry_budget', True))
         try:
@@ -653,6 +658,93 @@ class PhoneAgent:
         if removed:
             logging.info(f"Cleaned up {removed} old screenshot(s), kept {keep_last}")
         return removed
+
+    def get_ui_tree(self) -> List[Dict[str, Any]]:
+        """
+        Fetch the current UI tree and extract interactable elements with their center coordinates.
+        Returns a list of dicts.
+        """
+        if self.config.get('ios_enabled', False):
+            return self._get_ios_ui_tree()
+        else:
+            return self._get_android_ui_tree()
+
+    def _get_android_ui_tree(self) -> List[Dict[str, Any]]:
+        elements = []
+        try:
+            timestamp = int(time.time() * 1000)
+            remote_tmp = f"/sdcard/ui_dump_{timestamp}.xml"
+            local_tmp = os.path.join(self.config.get('screenshot_dir', './screenshots'), f"ui_dump_{timestamp}.xml")
+
+            self._run_adb_command(["shell", "uiautomator", "dump", remote_tmp])
+            self._run_adb_command(["pull", remote_tmp, local_tmp])
+            self._run_adb_command(["shell", "rm", remote_tmp])
+
+            if os.path.exists(local_tmp):
+                try:
+                    tree = ET.parse(local_tmp)
+                    root = tree.getroot()
+                    
+                    def parse_bounds(bounds_str: str) -> Optional[List[int]]:
+                        # bounds="[x1,y1][x2,y2]"
+                        match = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
+                        if match:
+                            return [int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))]
+                        return None
+
+                    for node in root.iter('node'):
+                        bounds_str = str(node.attrib.get('bounds', ''))
+                        bounds = parse_bounds(bounds_str)
+                        if not bounds:
+                            continue
+                            
+                        x1, y1, x2, y2 = bounds
+                        width = x2 - x1
+                        height = y2 - y1
+                        
+                        # filter out invisible or too small elements
+                        if width <= 5 or height <= 5:
+                            continue
+                            
+                        text = str(node.attrib.get('text', '')).strip()
+                        desc = str(node.attrib.get('content-desc', '')).strip()
+                        resource_id = str(node.attrib.get('resource-id', '')).strip()
+                        clickable = str(node.attrib.get('clickable', 'false')).lower() == 'true'
+                        
+                        if text or desc or clickable or resource_id:
+                            center_x = x1 + width // 2
+                            center_y = y1 + height // 2
+                            
+                            elements.append({
+                                'text': text,
+                                'content_desc': desc,
+                                'resource_id': resource_id,
+                                'center_x': center_x,
+                                'center_y': center_y,
+                                'width': width,
+                                'height': height,
+                                'clickable': clickable
+                            })
+                finally:
+                    try:
+                        os.remove(local_tmp)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"Failed to get Android UI tree: {e}")
+            
+        return elements
+
+    def _get_ios_ui_tree(self) -> List[Dict[str, Any]]:
+        # To be implemented using ios_service /source endpoint
+        elements = []
+        try:
+            pass
+        except Exception as e:
+            logging.warning(f"Failed to get iOS UI tree: {e}")
+            
+        return elements
+
 
     def benchmark_screenshot_performance(self, sample_count: int = 10) -> Dict[str, Any]:
         """Benchmark fast vs legacy screenshot path and report avg/p50/p95 milliseconds."""
@@ -1236,11 +1328,16 @@ class PhoneAgent:
             'must_avoid_same_action': True,
         }
 
+        ui_tree_data = None
+        if self.config.get('enable_ui_tree_injection', True) or self.config.get('enable_smart_replay', True):
+            ui_tree_data = self.get_ui_tree()
+
         corrected_action = self.vl_agent.analyze_screenshot(
             fresh_screenshot,
             user_request,
             self.context,
             retry_feedback=feedback_payload,
+            ui_context=ui_tree_data if self.config.get('enable_ui_tree_injection', True) else None
         )
 
         if not corrected_action:
@@ -1263,6 +1360,7 @@ class PhoneAgent:
                 user_request,
                 self.context,
                 retry_feedback=feedback_payload,
+                ui_context=ui_tree_data
             )
 
         if not corrected_action or self._actions_equivalent(corrected_action, failed_action):
@@ -1283,6 +1381,9 @@ class PhoneAgent:
         corrected_result['retry_decision'] = decision['decision']
         corrected_result['corrected_action'] = corrected_action
         self.context['retry_decisions'].append(decision)
+
+        if corrected_result.get('success', False) and self.config.get('enable_smart_replay', True) and self.replay_engine.is_recording:
+            self.replay_engine.record_step(ui_tree_data, corrected_action, corrected_result)
 
         logging.info(
             f"Retry correction decision: reason={retry_reason}, action={corrected_action.get('action')}, success={corrected_result.get('success')}"
@@ -1306,6 +1407,9 @@ class PhoneAgent:
 
         if not hasattr(self, 'task_planner') or self.task_planner is None:
             self.task_planner = TaskPlanner(max_steps=int(self.config.get('planner_max_steps', 8)))
+
+        if not hasattr(self, 'replay_engine'):
+            self.replay_engine = ReplayEngine(records_dir=self.config.get('records_dir', 'records'))
 
         if not hasattr(self, 'current_plan'):
             self.current_plan = None
@@ -1681,11 +1785,21 @@ class PhoneAgent:
         if exception_result is not None:
             return exception_result
 
-        action = self.vl_agent.analyze_screenshot(
-            screenshot_path,
-            user_request,
-            self.context
-        )
+        ui_tree_data = None
+        if self.config.get('enable_ui_tree_injection', True) or self.config.get('enable_smart_replay', True):
+            ui_tree_data = self.get_ui_tree()
+
+        action = None
+        if self.config.get('enable_smart_replay', True) and self.replay_engine.is_playing:
+            action = self.replay_engine.get_next_action(ui_tree_data)
+
+        if not action:
+            action = self.vl_agent.analyze_screenshot(
+                screenshot_path,
+                user_request,
+                self.context,
+                ui_context=ui_tree_data if self.config.get('enable_ui_tree_injection', True) else None
+            )
 
         if not action:
             raise Exception("Failed to get action from model")
@@ -1700,10 +1814,15 @@ class PhoneAgent:
         result = self.execute_action(action)
         result['screenshot_path'] = screenshot_path
         result['planned_action'] = action
+        result['ui_tree_data'] = ui_tree_data
         result.setdefault('preempted_by_exception', False)
         result.setdefault('exception_type', None)
         result.setdefault('handler_action', None)
         result.setdefault('hitl_triggered', False)
+
+        if result.get('success', False) and self.config.get('enable_smart_replay', True) and self.replay_engine.is_recording:
+            self.replay_engine.record_step(ui_tree_data, action, result)
+
         return result
     
     def execute_task(self, user_request: str, max_cycles: int = 15) -> Dict[str, Any]:
@@ -1743,6 +1862,10 @@ class PhoneAgent:
         logging.info(f'STARTING TASK: {user_request}')
         if self.context['continuous_task']:
             logging.info('Continuous task mode: ON')
+
+        if self.config.get('enable_smart_replay', True):
+            if not self.replay_engine.try_start_playback(user_request):
+                self.replay_engine.start_recording(user_request)
 
         plan, recovered_step_index, resumed = self._prepare_plan_and_recovery(user_request)
         steps = plan.get('steps', [])
@@ -1840,7 +1963,13 @@ class PhoneAgent:
             if last_error:
                 logging.info(f"Last error: {last_error}")
             success = False
-        logging.info('=' * 60)
+
+        if success:
+            if self.config.get('enable_smart_replay', True):
+                self.replay_engine.save_record()
+        else:
+            if self.config.get('enable_smart_replay', True):
+                self.replay_engine.cancel_recording()
 
         if task_complete:
             self._clear_checkpoint()
