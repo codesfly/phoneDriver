@@ -436,7 +436,7 @@ Task progress (You have done the following operation on the current device): {hi
 
             # Fallback: sometimes model returns raw JSON directly
             if not match:
-                raw_json_match = re.search(r"\{\s*\"name\"\s*:\s*\"mobile_use\".*\}", text, re.DOTALL)
+                raw_json_match = re.search(r'\{\s*\"name\"\s*:\s*\"mobile_use\".*?\}', text, re.DOTALL)
                 if raw_json_match:
                     tool_call_json = raw_json_match.group(0)
                 else:

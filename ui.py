@@ -3,7 +3,7 @@ import json
 import logging
 import subprocess
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Lock
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import gradio as gr
@@ -27,12 +27,15 @@ class UILogHandler(logging.Handler):
 
 
 # Global state
+_state_lock = Lock()
 current_screenshot = None
 log_handler = None
 is_running = False
 agent = None
 current_config = None
 last_health_result = None
+_ios_service_instance: Optional[IOSBridgeService] = None
+_ios_service_config_hash: Optional[int] = None
 
 TOS_NOTICE_TEXT = (
     "⚠️ 合规提醒：移动端自动化可能违反平台 TOS，仅限个人设备测试与合规场景。"
@@ -154,7 +157,7 @@ def get_default_config():
     return {
         "device_id": None,
         "screen_width": 1080,
-        "screen_height": 2340,
+        "screen_height": 2400,
         "screenshot_dir": "./screenshots",
         "max_retries": 3,
         "use_fast_screencap": True,
@@ -396,7 +399,8 @@ def execute_task_thread(task, max_cycles, config):
     if log_handler:
         log_handler.logs.clear()
     
-    is_running = True
+    with _state_lock:
+        is_running = True
     
     try:
         logging.info(f"开始执行任务: {task}")
@@ -414,15 +418,16 @@ def execute_task_thread(task, max_cycles, config):
             agent.context['session_id'] = datetime.now().strftime("%Y%m%d_%H%M%S")
             agent.context['screenshots'] = []
         
-        # Monkey-patch to capture screenshots
-        original_capture = agent.capture_screenshot
-        def capture_with_tracking():
-            path = original_capture()
-            global current_screenshot
-            current_screenshot = path
-            return path
-        
-        agent.capture_screenshot = capture_with_tracking
+        # Monkey-patch to capture screenshots (guard against re-wrapping)
+        if not getattr(agent, '_capture_patched', False):
+            original_capture = agent.capture_screenshot
+            def capture_with_tracking():
+                path = original_capture()
+                global current_screenshot
+                current_screenshot = path
+                return path
+            agent.capture_screenshot = capture_with_tracking
+            agent._capture_patched = True
         
         # Execute task
         result = agent.execute_task(task, max_cycles=max_cycles)
@@ -437,7 +442,8 @@ def execute_task_thread(task, max_cycles, config):
     except Exception as e:
         logging.error(f"任务执行异常: {e}", exc_info=True)
     finally:
-        is_running = False
+        with _state_lock:
+            is_running = False
 
 
 def start_task(task, max_cycles, config_json):
@@ -446,13 +452,14 @@ def start_task(task, max_cycles, config_json):
 
     waiting_tree = "### 🌲 任务树 / 规划步骤\n\n任务已启动，正在生成规划步骤..."
 
-    if is_running:
-        return (
-            "⚠️ 当前已有任务在运行",
-            None,
-            gr.update(active=False),
-            waiting_tree,
-        )
+    with _state_lock:
+        if is_running:
+            return (
+                "⚠️ 当前已有任务在运行",
+                None,
+                gr.update(active=False),
+                waiting_tree,
+            )
 
     if not task.strip():
         return (
@@ -609,7 +616,14 @@ def clear_logs_fn():
 
 
 def _ios_service_from_config(cfg: Optional[Dict[str, Any]] = None) -> IOSBridgeService:
-    return IOSBridgeService.from_config(cfg or current_config or load_config())
+    """Return a reusable IOSBridgeService; only recreate if config changed."""
+    global _ios_service_instance, _ios_service_config_hash
+    effective_cfg = cfg or current_config or load_config()
+    cfg_hash = hash(json.dumps(effective_cfg, sort_keys=True))
+    if _ios_service_instance is None or _ios_service_config_hash != cfg_hash:
+        _ios_service_instance = IOSBridgeService.from_config(effective_cfg)
+        _ios_service_config_hash = cfg_hash
+    return _ios_service_instance
 
 
 def ios_discover_devices_ui(config_json: str):
@@ -727,8 +741,188 @@ def ios_terminate_app_ui(config_json: str, udid: str, bundle_id: str):
         return f"✗ iOS terminate 失败: {e}"
 
 
+
+# ---------------------------------------------------------------------------
+#  Dark-theme Dashboard CSS
+# ---------------------------------------------------------------------------
+CUSTOM_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+    --bg-primary:   #0d1117;
+    --bg-card:      #161b22;
+    --bg-input:     #1c2128;
+    --bg-hover:     #1f2937;
+    --border:       #30363d;
+    --border-focus: #00d4aa;
+    --accent:       #00d4aa;
+    --accent-dim:   rgba(0,212,170,.12);
+    --accent-blue:  #58a6ff;
+    --text-primary: #e6edf3;
+    --text-secondary:#8b949e;
+    --text-muted:   #6e7681;
+    --danger:       #f85149;
+    --warning:      #f0883e;
+    --success:      #3fb950;
+    --radius:       12px;
+    --radius-sm:    8px;
+}
+
+body, .gradio-container {
+    background: var(--bg-primary) !important;
+    color: var(--text-primary) !important;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+}
+.gradio-container { max-width: 1600px !important; }
+
+#header-bar {
+    background: linear-gradient(135deg, #161b22 0%, #1a2332 100%) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important;
+    padding: 14px 24px !important;
+    margin-bottom: 16px !important;
+}
+#header-bar .prose h1 {
+    background: linear-gradient(135deg, #00d4aa 0%, #58a6ff 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-size: 1.5rem !important;
+    margin: 0 !important;
+}
+
+.dark-card {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important;
+    padding: 18px !important;
+}
+
+.gradio-container input,
+.gradio-container textarea,
+.gradio-container select,
+.gradio-container .wrap {
+    background: var(--bg-input) !important;
+    color: var(--text-primary) !important;
+    border-color: var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+}
+.gradio-container input:focus,
+.gradio-container textarea:focus {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 2px var(--accent-dim) !important;
+}
+.gradio-container label, .gradio-container .label-wrap {
+    color: var(--text-secondary) !important;
+    font-weight: 500 !important;
+}
+
+button.primary, button[variant="primary"] {
+    background: linear-gradient(135deg, #00d4aa 0%, #00b894 100%) !important;
+    color: #0d1117 !important;
+    border: none !important;
+    border-radius: var(--radius-sm) !important;
+    font-weight: 600 !important;
+    transition: all .2s ease !important;
+}
+button.primary:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 4px 16px rgba(0,212,170,.35) !important;
+}
+button.stop, button[variant="stop"] {
+    background: rgba(248,81,73,.15) !important;
+    color: var(--danger) !important;
+    border: 1px solid var(--danger) !important;
+    border-radius: var(--radius-sm) !important;
+    font-weight: 600 !important;
+}
+button.secondary, .gradio-container button {
+    background: var(--bg-input) !important;
+    color: var(--text-primary) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+    transition: all .15s ease !important;
+}
+button.secondary:hover, .gradio-container button:hover {
+    background: var(--bg-hover) !important;
+    border-color: var(--accent) !important;
+}
+
+#phone-preview img {
+    border-radius: 16px !important;
+    border: 2px solid var(--border) !important;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4) !important;
+    max-height: 560px !important;
+    object-fit: contain !important;
+}
+#phone-preview {
+    background: var(--bg-card) !important;
+    border-radius: var(--radius) !important;
+    border: 1px solid var(--border) !important;
+}
+
+#log-panel textarea {
+    background: #0d1117 !important;
+    color: #7ee787 !important;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
+    font-size: 12px !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+}
+
+#task-tree-panel {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important;
+    padding: 16px !important;
+    color: var(--text-primary) !important;
+}
+
+.gradio-container .gr-accordion {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important;
+    margin-top: 8px !important;
+}
+
+.gradio-container .prose {
+    color: var(--text-primary) !important;
+}
+.gradio-container .prose h2, .gradio-container .prose h3 {
+    color: var(--text-primary) !important;
+    border-bottom: 1px solid var(--border) !important;
+    padding-bottom: 6px !important;
+}
+
+.gradio-container .cm-editor,
+.gradio-container .code-wrap {
+    background: var(--bg-input) !important;
+    border-radius: var(--radius-sm) !important;
+}
+
+.gradio-container input[type="checkbox"] {
+    accent-color: var(--accent) !important;
+}
+.gradio-container input[type="range"] {
+    accent-color: var(--accent) !important;
+}
+"""
+
+
+def get_device_display_name() -> str:
+    """Build a human-readable string for the current device (multi-device ready)."""
+    if last_health_result and last_health_result.get("status") == "ok":
+        dev = last_health_result.get("device_id", "unknown")
+        w = last_health_result.get("screen_width", "?")
+        h = last_health_result.get("screen_height", "?")
+        return f"🟢 {dev}  ({w}×{h})"
+    elif last_health_result:
+        errors = last_health_result.get("errors", [])
+        return f"🔴 未连接 — {errors[0] if errors else '设备离线'}"
+    return "⚪ 未检测"
+
+
 def create_ui():
-    """Create the Gradio interface."""
+    """Create the Gradio dashboard interface with dark theme."""
     global current_config, last_health_result
     current_config = load_config()
 
@@ -738,249 +932,296 @@ def create_ui():
 
     Path(current_config['screenshot_dir']).mkdir(parents=True, exist_ok=True)
 
-    with gr.Blocks(title="PhoneDriver 控制台", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# 📱 PhoneDriver 控制台")
-        gr.Markdown("*基于 Qwen3-VL 的移动端自动化（Web 控制台）*")
-        gr.Markdown(f"**{TOS_NOTICE_TEXT}**")
-        
-        with gr.Tabs():
-            with gr.Tab("🎯 任务控制"):
+    dark_theme = gr.themes.Base(
+        primary_hue=gr.themes.Color(
+            c50="#e6fff8", c100="#b3ffe6", c200="#80ffd4",
+            c300="#4dffc3", c400="#1affb1", c500="#00e6a0",
+            c600="#00d4aa", c700="#00b894", c800="#009b7d",
+            c900="#007f67", c950="#006652",
+        ),
+        neutral_hue=gr.themes.Color(
+            c50="#f0f6fc", c100="#c9d1d9", c200="#b1bac4",
+            c300="#8b949e", c400="#6e7681", c500="#484f58",
+            c600="#30363d", c700="#21262d", c800="#161b22",
+            c900="#0d1117", c950="#010409",
+        ),
+        font=gr.themes.GoogleFont("Inter"),
+    ).set(
+        body_background_fill="#0d1117",
+        body_text_color="#e6edf3",
+        block_background_fill="#161b22",
+        block_border_color="#30363d",
+        block_label_text_color="#8b949e",
+        block_title_text_color="#e6edf3",
+        input_background_fill="#1c2128",
+        input_border_color="#30363d",
+        button_primary_background_fill="linear-gradient(135deg, #00d4aa 0%, #00b894 100%)",
+        button_primary_text_color="#0d1117",
+        button_secondary_background_fill="#1c2128",
+        button_secondary_text_color="#e6edf3",
+        button_secondary_border_color="#30363d",
+    )
+
+    with gr.Blocks(title="PhoneDriver Dashboard", theme=dark_theme, css=CUSTOM_CSS) as demo:
+
+        # ── Top header bar ──────────────────────────────────────
+        with gr.Group(elem_id="header-bar"):
+            with gr.Row():
+                with gr.Column(scale=3, min_width=200):
+                    gr.Markdown("# 📱 PhoneDriver")
+                with gr.Column(scale=4, min_width=300):
+                    device_display = gr.Textbox(
+                        value=get_device_display_name(),
+                        label="当前设备",
+                        interactive=False,
+                        elem_id="device-selector",
+                    )
+                with gr.Column(scale=2, min_width=160):
+                    with gr.Row():
+                        refresh_device_btn = gr.Button("🔄 刷新设备", size="sm")
+                        add_device_btn = gr.Button("➕ 添加设备", size="sm")
+
+        # ── Main 3-column dashboard ─────────────────────────────
+        with gr.Row():
+
+            # ── LEFT: Task input ────────────────────────────────
+            with gr.Column(scale=4, min_width=320):
+                gr.Markdown("### 🎯 任务控制")
+
+                preset_task = gr.Dropdown(
+                    label="预设任务",
+                    choices=list(PRESET_TASK_LIBRARY.keys()),
+                    value="（不使用预设）",
+                )
+                preset_status = gr.Textbox(
+                    value="选择预设或直接输入自定义任务",
+                    interactive=False,
+                    show_label=False,
+                    lines=1,
+                )
+
+                task_input = gr.Textbox(
+                    label="任务描述",
+                    placeholder="描述你想执行的任务，例如：打开浏览器搜索上海天气",
+                    lines=4,
+                )
+
                 with gr.Row():
-                    with gr.Column(scale=2):
-                        preset_task = gr.Dropdown(
-                            label="预设任务",
-                            choices=list(PRESET_TASK_LIBRARY.keys()),
-                            value="（不使用预设）",
-                        )
+                    max_cycles = gr.Number(
+                        label="最大轮次",
+                        value=15,
+                        minimum=1,
+                        maximum=100,
+                    )
 
-                        task_input = gr.Textbox(
-                            label="任务描述",
-                            placeholder="例如：打开浏览器并搜索上海天气",
-                            lines=3
-                        )
+                with gr.Row():
+                    start_btn = gr.Button(
+                        "▶  开始任务",
+                        variant="primary",
+                        scale=3,
+                        size="lg",
+                    )
+                    stop_btn = gr.Button(
+                        "⏹  停止",
+                        variant="stop",
+                        scale=1,
+                        size="lg",
+                    )
 
-                        preset_status = gr.Textbox(
-                            label="预设状态",
-                            value="可从上方下拉选择预设任务，一键填充任务描述。",
-                            interactive=False,
-                            lines=1,
-                        )
+                status_text = gr.Textbox(
+                    label="运行状态",
+                    lines=2,
+                    interactive=False,
+                )
 
-                        with gr.Row():
-                            max_cycles = gr.Number(
-                                label="最大轮次",
-                                value=15,
-                                minimum=1,
-                                maximum=50
-                            )
-                            start_btn = gr.Button("▶️ 开始任务", variant="primary", scale=2)
-                            stop_btn = gr.Button("⏹️ 停止", variant="stop", scale=1)
+            # ── CENTER: Plan + Logs ─────────────────────────────
+            with gr.Column(scale=4, min_width=340):
+                gr.Markdown("### 🌲 任务规划")
+                task_tree_output = gr.Markdown(
+                    value=format_task_tree_markdown(None, None, None),
+                    elem_id="task-tree-panel",
+                )
 
-                        status_text = gr.Textbox(label="状态", lines=2, interactive=False)
-
-                    with gr.Column(scale=3):
-                        image_output = gr.Image(
-                            label="当前屏幕",
-                            type="filepath",
-                            height=520
-                        )
-
-                        task_tree_output = gr.Markdown(
-                            value=format_task_tree_markdown(None, None, None),
-                            elem_id="task-tree-panel",
-                        )
-                
+                gr.Markdown("### 📋 执行日志")
                 log_output = gr.Textbox(
-                    label="📋 执行日志",
-                    lines=15,
+                    lines=14,
                     max_lines=20,
                     interactive=False,
-                    show_copy_button=True
+                    show_copy_button=True,
+                    show_label=False,
+                    elem_id="log-panel",
                 )
-                
                 with gr.Row():
-                    refresh_btn = gr.Button("🔄 刷新显示")
-                    clear_logs_btn = gr.Button("🗑️ 清空日志")
-            
-            with gr.Tab("⚙️ 设置"):
-                gr.Markdown("### 设备配置")
+                    refresh_btn = gr.Button("🔄 刷新", size="sm")
+                    clear_logs_btn = gr.Button("🗑️ 清空日志", size="sm")
 
-                health_status = gr.Textbox(
-                    label="启动健康检查（ADB + 设备 + 分辨率）",
-                    value=format_health_result(startup_health),
-                    interactive=False,
+            # ── RIGHT: Phone preview ────────────────────────────
+            with gr.Column(scale=3, min_width=280):
+                gr.Markdown("### 📱 设备屏幕")
+                image_output = gr.Image(
+                    type="filepath",
+                    height=560,
+                    show_label=False,
+                    elem_id="phone-preview",
                 )
 
-                with gr.Row():
-                    with gr.Column():
-                        detect_btn = gr.Button("🔍 自动检测设备分辨率")
+        # ── Bottom collapsible panels ───────────────────────────
+        with gr.Accordion("⚙️ 设备与模型设置", open=False):
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("#### 设备配置")
+                    health_status = gr.Textbox(
+                        label="健康检查",
+                        value=format_health_result(startup_health),
+                        interactive=False,
+                    )
+                    with gr.Row():
+                        detect_btn = gr.Button("🔍 自动检测分辨率")
                         refresh_health_btn = gr.Button("♻️ 刷新健康检查")
-                        detect_status = gr.Textbox(label="检测状态", interactive=False)
-
-                    with gr.Column():
+                    detect_status = gr.Textbox(label="检测状态", interactive=False)
+                    with gr.Row():
                         screen_width = gr.Number(
-                            label="屏幕宽度（像素）",
-                            value=current_config['screen_width']
+                            label="屏幕宽度",
+                            value=current_config['screen_width'],
                         )
                         screen_height = gr.Number(
-                            label="屏幕高度（像素）",
-                            value=current_config['screen_height']
+                            label="屏幕高度",
+                            value=current_config['screen_height'],
                         )
-                
-                gr.Markdown("### 模型参数")
-                
-                with gr.Row():
+
+                with gr.Column():
+                    gr.Markdown("#### 模型参数")
                     temperature = gr.Slider(
-                        label="温度（Temperature）",
-                        minimum=0.0,
-                        maximum=1.0,
+                        label="温度",
+                        minimum=0.0, maximum=1.0,
                         value=current_config['temperature'],
-                        step=0.05
+                        step=0.05,
                     )
                     max_tokens = gr.Number(
                         label="最大 Tokens",
                         value=current_config['max_tokens'],
-                        minimum=128,
-                        maximum=2048
+                        minimum=128, maximum=2048,
                     )
-                
-                with gr.Row():
                     step_delay = gr.Slider(
                         label="动作间隔（秒）",
-                        minimum=0.5,
-                        maximum=5.0,
+                        minimum=0.5, maximum=5.0,
                         value=current_config['step_delay'],
-                        step=0.1
+                        step=0.1,
                     )
-                
-                gr.Markdown("### 高级选项")
-                
-                with gr.Row():
+
+                with gr.Column():
+                    gr.Markdown("#### 高级选项")
                     use_flash_attn = gr.Checkbox(
-                        label="启用 Flash Attention 2（可选）",
-                        value=current_config.get('use_flash_attention', False)
+                        label="Flash Attention 2",
+                        value=current_config.get('use_flash_attention', False),
                     )
                     visual_debug = gr.Checkbox(
-                        label="启用可视化调试",
-                        value=current_config.get('enable_visual_debug', False)
+                        label="可视化调试",
+                        value=current_config.get('enable_visual_debug', False),
                     )
                     use_fast_screencap = gr.Checkbox(
-                        label="启用快速截图（adb exec-out）",
-                        value=current_config.get('use_fast_screencap', True)
+                        label="快速截图 (exec-out)",
+                        value=current_config.get('use_fast_screencap', True),
                     )
-
-                gr.Markdown("### 连续任务（刷一会/持续任务）")
-                with gr.Row():
+                    gr.Markdown("#### 连续任务")
                     ignore_terminate_continuous = gr.Checkbox(
-                        label="连续任务忽略过早 terminate",
-                        value=current_config.get('ignore_terminate_for_continuous_tasks', True)
+                        label="忽略过早 terminate",
+                        value=current_config.get('ignore_terminate_for_continuous_tasks', True),
                     )
                     continuous_min_cycles = gr.Number(
-                        label="连续任务最小轮次",
+                        label="最小轮次",
                         value=current_config.get('continuous_min_cycles', 20),
-                        minimum=1,
-                        maximum=500
+                        minimum=1, maximum=500,
                     )
                     continuous_min_minutes = gr.Number(
-                        label="连续任务最小时长（分钟）",
+                        label="最小时长（分）",
                         value=current_config.get('continuous_min_minutes', 0),
-                        minimum=0,
-                        maximum=600
+                        minimum=0, maximum=600,
                     )
-                
+
+            with gr.Row():
                 apply_btn = gr.Button("💾 保存设置", variant="primary")
-                settings_status = gr.Textbox(label="设置状态", interactive=False)
-                
-                gr.Markdown("### 配置 JSON")
-                config_editor = gr.Code(
-                    label="当前配置",
-                    language="json",
-                    value=json.dumps(current_config, indent=2, ensure_ascii=False),
-                    lines=15
+                settings_status = gr.Textbox(label="状态", interactive=False)
+
+            config_editor = gr.Code(
+                label="配置 JSON",
+                language="json",
+                value=json.dumps(current_config, indent=2, ensure_ascii=False),
+                lines=12,
+            )
+
+        with gr.Accordion("🍎 iOS Bridge", open=False):
+            gr.Markdown(
+                "macOS + go-ios + WDA 最小桥接 · 自动 tunnel/runwda · session 复用 · 环境异常显式报错"
+            )
+            with gr.Row():
+                ios_udid = gr.Textbox(
+                    label="iOS UDID（留空使用默认）",
+                    value=current_config.get("ios_default_udid", ""),
                 )
-            
-            with gr.Tab("🍎 iOS Bridge"):
-                gr.Markdown("### iOS 最小可用桥接（macOS + go-ios + WDA）")
-                gr.Markdown("- 仅支持 macOS（Darwin）\n- 需要本机可执行 `go-ios`\n- 可自动拉起 tunnel / runwda，并等待 WDA readiness\n- 支持 session 自动创建与复用\n- Debug-first：环境未就绪会显式报错，不会假成功")
+                ios_bundle_id = gr.Textbox(
+                    label="Bundle ID",
+                    placeholder="com.apple.Preferences",
+                    value="",
+                )
 
-                with gr.Row():
-                    ios_udid = gr.Textbox(
-                        label="iOS UDID（可选，留空使用 config.ios_default_udid）",
-                        value=current_config.get("ios_default_udid", ""),
-                    )
-                    ios_bundle_id = gr.Textbox(
-                        label="Bundle ID（用于 launch/terminate）",
-                        placeholder="例如：com.apple.Preferences",
-                        value="",
-                    )
+            with gr.Row():
+                ios_discover_btn = gr.Button("🔎 发现设备")
+                ios_prepare_btn = gr.Button("🧰 一键准备")
+                ios_health_btn = gr.Button("🩺 健康检查")
+                ios_screenshot_btn = gr.Button("📸 截图")
+                ios_source_btn = gr.Button("📄 UI Source")
 
-                with gr.Row():
-                    ios_discover_btn = gr.Button("🔎 发现设备 (go-ios list)")
-                    ios_prepare_btn = gr.Button("🧰 一键准备 (tunnel+runwda+session)")
-                    ios_health_btn = gr.Button("🩺 健康检查 (go-ios + WDA)")
-                    ios_screenshot_btn = gr.Button("📸 iOS 截图")
-                    ios_source_btn = gr.Button("📄 获取 UI Source")
+            with gr.Row():
+                ios_tap_x = gr.Number(label="X", value=200, scale=1)
+                ios_tap_y = gr.Number(label="Y", value=300, scale=1)
+                ios_tap_btn = gr.Button("👆 Tap", scale=1)
+                ios_type_text = gr.Textbox(label="文本", value="hello", scale=2)
+                ios_type_btn = gr.Button("⌨️ Type", scale=1)
 
-                with gr.Row():
-                    ios_tap_x = gr.Number(label="tap X", value=200)
-                    ios_tap_y = gr.Number(label="tap Y", value=300)
-                    ios_tap_btn = gr.Button("👆 Tap")
+            with gr.Row():
+                ios_swipe_x1 = gr.Number(label="X1", value=300)
+                ios_swipe_y1 = gr.Number(label="Y1", value=1200)
+                ios_swipe_x2 = gr.Number(label="X2", value=300)
+                ios_swipe_y2 = gr.Number(label="Y2", value=400)
+                ios_swipe_duration = gr.Number(label="时长(s)", value=0.2)
+                ios_swipe_btn = gr.Button("↕️ Swipe")
 
-                with gr.Row():
-                    ios_swipe_x1 = gr.Number(label="swipe X1", value=300)
-                    ios_swipe_y1 = gr.Number(label="swipe Y1", value=1200)
-                    ios_swipe_x2 = gr.Number(label="swipe X2", value=300)
-                    ios_swipe_y2 = gr.Number(label="swipe Y2", value=400)
-                    ios_swipe_duration = gr.Number(label="duration(s)", value=0.2)
-                    ios_swipe_btn = gr.Button("↕️ Swipe")
+            with gr.Row():
+                ios_launch_btn = gr.Button("🚀 Launch App")
+                ios_terminate_btn = gr.Button("🛑 Terminate App")
 
-                with gr.Row():
-                    ios_type_text = gr.Textbox(label="输入文本", value="hello")
-                    ios_type_btn = gr.Button("⌨️ Type")
-                    ios_launch_btn = gr.Button("🚀 Launch App")
-                    ios_terminate_btn = gr.Button("🛑 Terminate App")
+            ios_image_output = gr.Image(label="iOS 截图", type="filepath", height=400)
+            ios_result_output = gr.Textbox(
+                label="iOS 输出", lines=10, max_lines=16, interactive=False,
+            )
 
-                ios_image_output = gr.Image(label="iOS 当前截图", type="filepath", height=420)
-                ios_result_output = gr.Textbox(label="iOS 输出", lines=14, max_lines=20, interactive=False)
-
-            with gr.Tab("❓ 帮助"):
-                gr.Markdown("""
+        with gr.Accordion("❓ 帮助与故障排查", open=False):
+            gr.Markdown("""
 ## 快速开始
+1. **连接设备** — 开启 USB 调试，连接设备
+2. **检测分辨率** — 展开"设备与模型设置"点击自动检测
+3. **选择预设（可选）** — 下拉选择，一键填充任务描述
+4. **运行任务** — 点击"开始任务"
 
-1. **连接设备**：开启 USB 调试，连接设备
-2. **配置分辨率**：在“设置”页点击自动检测
-3. **选择预设（可选）**：在“任务控制”页选择预设任务，一键填充输入框
-4. **运行任务**：检查任务描述并点击“开始任务”
-
-## 任务树如何理解
-- 右侧“任务树 / 规划步骤”会展示 phase2 生成的步骤清单。
-- 每个步骤包含：`step_name`（步骤名）、`instruction`（执行指令）、`success_criteria`（成功标准）。
-- 状态说明：
-  - ⬜ 待执行
-  - 🟡 执行中
-  - 🟢 已完成
-  - 🔴 失败
-- “当前步骤索引”表示当前正在执行（或最后一次停留）的步骤位置。
-
-## 预设任务如何使用
-- 在“预设任务”下拉选择一个场景，会自动填充“任务描述”。
-- 若选择“（不使用预设）”，将保留当前输入内容。
-- 建议先用预设验证环境连通，再改成自定义任务。
-
-## 任务示例
-- “打开浏览器并搜索上海天气”
-- “打开设置检查网络连接”
-- “进入应用并停留 10 秒”
+## 任务树状态
+| 图标 | 含义 |
+|------|------|
+| ⬜ | 待执行 |
+| 🟡 | 执行中 |
+| 🟢 | 已完成 |
+| 🔴 | 失败 |
 
 ## 故障排查
-- **点击不准**：检查设置页的分辨率是否与真机一致
-- **找不到设备**：在终端执行 `adb devices`
-- **执行报错**：查看“执行日志”与“任务树”中的失败步骤
-                """)
-        
+- **点击不准** — 检查分辨率是否与真机一致
+- **找不到设备** — 终端执行 `adb devices`
+- **执行报错** — 查看日志和任务树失败步骤
+            """)
+
+        # ── Hidden timer ────────────────────────────────────────
         timer = gr.Timer(value=3, active=False)
-        
-        # Event handlers
+
+        # ── Event bindings ──────────────────────────────────────
         preset_task.change(
             fn=apply_preset_task,
             inputs=[preset_task, task_input],
@@ -990,131 +1231,126 @@ def create_ui():
         start_btn.click(
             fn=start_task,
             inputs=[task_input, max_cycles, config_editor],
-            outputs=[status_text, image_output, timer, task_tree_output]
+            outputs=[status_text, image_output, timer, task_tree_output],
         )
 
-        stop_btn.click(
-            fn=stop_task,
-            outputs=status_text
-        )
+        stop_btn.click(fn=stop_task, outputs=status_text)
 
         timer.tick(
             fn=update_ui,
-            outputs=[image_output, log_output, timer, task_tree_output]
+            outputs=[image_output, log_output, timer, task_tree_output],
         )
 
         refresh_btn.click(
             fn=update_ui,
-            outputs=[image_output, log_output, timer, task_tree_output]
+            outputs=[image_output, log_output, timer, task_tree_output],
         )
 
-        clear_logs_btn.click(
-            fn=clear_logs_fn,
-            outputs=log_output
+        clear_logs_btn.click(fn=clear_logs_fn, outputs=log_output)
+
+        # Header device refresh
+        refresh_device_btn.click(
+            fn=refresh_health_status_ui,
+            outputs=[health_status, screen_width, screen_height, config_editor],
+        ).then(
+            fn=lambda: get_device_display_name(),
+            outputs=device_display,
         )
-        
+
+        add_device_btn.click(
+            fn=lambda: "ℹ️ 多设备管理即将支持，敬请期待！",
+            outputs=status_text,
+        )
+
+        # Settings panel
         detect_btn.click(
             fn=auto_detect_resolution,
-            outputs=[screen_width, screen_height, detect_status]
+            outputs=[screen_width, screen_height, detect_status],
         )
-        
+
         refresh_health_btn.click(
             fn=refresh_health_status_ui,
-            outputs=[health_status, screen_width, screen_height, config_editor]
+            outputs=[health_status, screen_width, screen_height, config_editor],
+        ).then(
+            fn=lambda: get_device_display_name(),
+            outputs=device_display,
         )
 
         apply_btn.click(
             fn=apply_settings,
             inputs=[
-                screen_width,
-                screen_height,
-                temperature,
-                max_tokens,
-                step_delay,
-                use_flash_attn,
-                visual_debug,
-                use_fast_screencap,
+                screen_width, screen_height,
+                temperature, max_tokens, step_delay,
+                use_flash_attn, visual_debug, use_fast_screencap,
                 ignore_terminate_continuous,
-                continuous_min_cycles,
-                continuous_min_minutes,
+                continuous_min_cycles, continuous_min_minutes,
             ],
-            outputs=[settings_status, config_editor]
+            outputs=[settings_status, config_editor],
         )
 
+        # iOS Bridge
         ios_discover_btn.click(
             fn=ios_discover_devices_ui,
             inputs=[config_editor],
             outputs=[ios_result_output],
         )
-
         ios_prepare_btn.click(
             fn=ios_prepare_ui,
             inputs=[config_editor, ios_udid],
             outputs=[ios_result_output],
         )
-
         ios_health_btn.click(
             fn=ios_health_check_ui,
             inputs=[config_editor, ios_udid],
             outputs=[ios_result_output],
         )
-
         ios_screenshot_btn.click(
             fn=ios_screenshot_ui,
             inputs=[config_editor, ios_udid],
             outputs=[ios_image_output, ios_result_output],
         )
-
         ios_source_btn.click(
             fn=ios_source_ui,
             inputs=[config_editor, ios_udid],
             outputs=[ios_result_output],
         )
-
         ios_tap_btn.click(
             fn=ios_tap_ui,
             inputs=[config_editor, ios_udid, ios_tap_x, ios_tap_y],
             outputs=[ios_result_output],
         )
-
         ios_swipe_btn.click(
             fn=ios_swipe_ui,
             inputs=[
-                config_editor,
-                ios_udid,
-                ios_swipe_x1,
-                ios_swipe_y1,
-                ios_swipe_x2,
-                ios_swipe_y2,
+                config_editor, ios_udid,
+                ios_swipe_x1, ios_swipe_y1,
+                ios_swipe_x2, ios_swipe_y2,
                 ios_swipe_duration,
             ],
             outputs=[ios_result_output],
         )
-
         ios_type_btn.click(
             fn=ios_type_ui,
             inputs=[config_editor, ios_udid, ios_type_text],
             outputs=[ios_result_output],
         )
-
         ios_launch_btn.click(
             fn=ios_launch_app_ui,
             inputs=[config_editor, ios_udid, ios_bundle_id],
             outputs=[ios_result_output],
         )
-
         ios_terminate_btn.click(
             fn=ios_terminate_app_ui,
             inputs=[config_editor, ios_udid, ios_bundle_id],
             outputs=[ios_result_output],
         )
-    
+
     return demo
 
 
 def main():
     """Main entry point for the UI."""
-    print("PhoneDriver UI 启动中...")
+    print("PhoneDriver Dashboard 启动中...")
     print(TOS_NOTICE_TEXT)
     print("正在初始化日志...")
     setup_logging()
@@ -1122,16 +1358,16 @@ def main():
 
     print("正在创建界面...")
     demo = create_ui()
-    
+
     print("服务已启动：http://localhost:7860")
     print("按 Ctrl+C 停止")
-    
+
     demo.queue()
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
-        show_error=True
+        show_error=True,
     )
 
 

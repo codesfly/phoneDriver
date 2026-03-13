@@ -188,7 +188,7 @@ class PhoneAgent:
         default_config = {
             'device_id': None,  # Auto-detect first device if None
             'screen_width': 1080,  # Must match your device
-            'screen_height': 2340,  # Must match your device
+            'screen_height': 2400,  # Must match your device
             'screenshot_dir': './screenshots',
             'max_retries': 3,
             'use_fast_screencap': True,
@@ -441,8 +441,8 @@ class PhoneAgent:
         health['device_id'] = selected_device
 
         try:
-            self._run_adb_command("shell echo 'Connected'")
-            size_output = self._run_adb_command("shell wm size")
+            self._run_adb_command(["shell", "echo", "Connected"])
+            size_output = self._run_adb_command(["shell", "wm", "size"])
             size = parse_wm_size_output(size_output)
             if not size:
                 health['errors'].append(f"unable to parse wm size output: {size_output.strip()}")
@@ -513,17 +513,24 @@ class PhoneAgent:
             logging.error(f"Failed to persist detected resolution: {e}")
             return False
     
-    def _run_adb_command(self, command: str) -> str:
-        """Execute an ADB command and return output."""
+    def _run_adb_command(self, args: List[str]) -> str:
+        """Execute an ADB command and return output.
+
+        Args:
+            args: ADB sub-command tokens, e.g. ["shell", "wm", "size"].
+                  The method prepends ["adb", "-s", device_id] automatically.
+        """
         device_id = self.config.get('device_id') if isinstance(self.config, dict) else None
-        device_prefix = f"-s {device_id}" if device_id else ""
-        full_command = f"adb {device_prefix} {command}"
+        cmd: List[str] = ["adb"]
+        if device_id:
+            cmd.extend(["-s", str(device_id)])
+        cmd.extend(args)
         timeout_s = int(self.config.get('adb_command_timeout', 15))
 
         try:
             result = subprocess.run(
-                full_command,
-                shell=True,
+                cmd,
+                shell=False,
                 check=True,
                 capture_output=True,
                 text=True,
@@ -531,13 +538,13 @@ class PhoneAgent:
             )
             return result.stdout
         except subprocess.TimeoutExpired as e:
-            logging.error(f"ADB command timeout ({timeout_s}s): {command}")
+            logging.error(f"ADB command timeout ({timeout_s}s): {args}")
             stderr = (e.stderr or "").strip() if hasattr(e, 'stderr') else ""
             if stderr:
                 logging.error(f"Timeout stderr: {stderr}")
-            raise TimeoutError(f"ADB command timed out after {timeout_s}s: {command}")
+            raise TimeoutError(f"ADB command timed out after {timeout_s}s: {args}")
         except subprocess.CalledProcessError as e:
-            logging.error(f"ADB command failed: {command}")
+            logging.error(f"ADB command failed: {args}")
             stderr = (e.stderr or '').strip()
             stdout = (e.stdout or '').strip()
             if stderr:
@@ -579,9 +586,9 @@ class PhoneAgent:
 
     def _capture_screenshot_legacy(self, screenshot_path: str) -> None:
         """Legacy path: adb shell screencap + adb pull."""
-        self._run_adb_command("shell screencap -p /sdcard/screenshot.png")
-        self._run_adb_command(f"pull /sdcard/screenshot.png {screenshot_path}")
-        self._run_adb_command("shell rm /sdcard/screenshot.png")
+        self._run_adb_command(["shell", "screencap", "-p", "/sdcard/screenshot.png"])
+        self._run_adb_command(["pull", "/sdcard/screenshot.png", screenshot_path])
+        self._run_adb_command(["shell", "rm", "/sdcard/screenshot.png"])
 
     def capture_screenshot(self) -> str:
         """
@@ -621,9 +628,35 @@ class PhoneAgent:
             logging.error(f"Screenshot capture failed: {e}")
             raise
 
+    def _cleanup_old_screenshots(self, keep_last: int = 20) -> int:
+        """Remove old screenshots, keeping only the most recent `keep_last` files.
+
+        Returns the number of files deleted.
+        """
+        screenshot_dir = self.config.get('screenshot_dir', './screenshots')
+        if not os.path.isdir(screenshot_dir):
+            return 0
+
+        files = sorted(
+            (os.path.join(screenshot_dir, f) for f in os.listdir(screenshot_dir)
+             if f.lower().endswith(('.png', '.jpg', '.jpeg'))),
+            key=os.path.getmtime,
+        )
+        to_delete = files[:-keep_last] if len(files) > keep_last else []
+        removed = 0
+        for path in to_delete:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            logging.info(f"Cleaned up {removed} old screenshot(s), kept {keep_last}")
+        return removed
+
     def benchmark_screenshot_performance(self, sample_count: int = 10) -> Dict[str, Any]:
         """Benchmark fast vs legacy screenshot path and report avg/p50/p95 milliseconds."""
-        samples = max(10, int(sample_count))
+        samples = max(1, int(sample_count))
 
         def _run_mode(mode: str) -> Dict[str, Any]:
             durations_ms: List[float] = []
@@ -790,7 +823,7 @@ class PhoneAgent:
         y = max(0, min(y, self.config['screen_height'] - 1))
         
         logging.info(f"Tapping at ({x}, {y}) [normalized: ({norm_x:.3f}, {norm_y:.3f})]")
-        self._run_adb_command(f"shell input tap {x} {y}")
+        self._run_adb_command(["shell", "input", "tap", str(x), str(y)])
     
     def _execute_swipe(self, action: Dict[str, Any]):
         """Execute a swipe action."""
@@ -803,25 +836,29 @@ class PhoneAgent:
         start_x, start_y = center_x, center_y
         
         # Define swipe distances (70% of screen dimension)
-        swipe_distance = 0.7
-        
+        swipe_distance = 0.35  # half of 70% — applied both above and below center
+
         if direction == 'up':
             end_x = center_x
-            end_y = int(center_y * (1 - swipe_distance))
+            end_y = int(center_y - self.config['screen_height'] * swipe_distance)
         elif direction == 'down':
             end_x = center_x
-            end_y = int(center_y * (1 + swipe_distance))
+            end_y = int(center_y + self.config['screen_height'] * swipe_distance)
         elif direction == 'left':
-            end_x = int(center_x * (1 - swipe_distance))
+            end_x = int(center_x - self.config['screen_width'] * swipe_distance)
             end_y = center_y
         elif direction == 'right':
-            end_x = int(center_x * (1 + swipe_distance))
+            end_x = int(center_x + self.config['screen_width'] * swipe_distance)
             end_y = center_y
         else:
             raise ValueError(f"Invalid swipe direction: {direction}")
+
+        # Clamp to screen bounds
+        end_x = max(0, min(end_x, self.config['screen_width'] - 1))
+        end_y = max(0, min(end_y, self.config['screen_height'] - 1))
         
         logging.info(f"Swiping {direction}: ({start_x}, {start_y}) -> ({end_x}, {end_y})")
-        self._run_adb_command(f"shell input swipe {start_x} {start_y} {end_x} {end_y} 300")
+        self._run_adb_command(["shell", "input", "swipe", str(start_x), str(start_y), str(end_x), str(end_y), "300"])
     
     def _execute_type(self, action: Dict[str, Any]):
         """Execute a type action."""
@@ -832,21 +869,23 @@ class PhoneAgent:
         if text.strip() == '':
             raise ValueError("Type action has empty text")
 
-        # Check if we tapped a text field recently
-        recent_actions = self.context['previous_actions'][-3:]
-        tapped_text_field = any(
-            a.get('action') == 'tap' for a in recent_actions
-        )
-
-        if not tapped_text_field:
-            logging.warning("Type action without recent tap - may fail")
-
-        # Escape and format text for ADB
-        escaped_text = text.replace("'", "\\'").replace('"', '\\"')
-        escaped_text = escaped_text.replace(" ", "%s")  # ADB requires %s for spaces
+        # Escape special characters for ADB input text.
+        # ADB `input text` interprets %s as spaces and does not handle
+        # most shell meta-characters.  We escape them here.
+        escaped_text = text.replace('%', '%p')   # percent first to avoid double-escape
+        escaped_text = escaped_text.replace(' ', '%s')
+        escaped_text = escaped_text.replace('"', '\\"')
+        escaped_text = escaped_text.replace("'", "\\'")
+        escaped_text = escaped_text.replace('&', '\\&')
+        escaped_text = escaped_text.replace('|', '\\|')
+        escaped_text = escaped_text.replace(';', '\\;')
+        escaped_text = escaped_text.replace('(', '\\(')
+        escaped_text = escaped_text.replace(')', '\\)')
+        escaped_text = escaped_text.replace('$', '\\$')
+        escaped_text = escaped_text.replace('`', '\\`')
 
         logging.info(f"Typing: {text}")
-        self._run_adb_command(f'shell input text "{escaped_text}"')
+        self._run_adb_command(["shell", "input", "text", escaped_text])
     
     def _execute_wait(self, action: Dict[str, Any]):
         """Execute a wait action."""
@@ -877,7 +916,7 @@ class PhoneAgent:
 
         keycode = key_map[key_text]
         logging.info(f"System action: {key_text} (KEYCODE {keycode})")
-        self._run_adb_command(f"shell input keyevent {keycode}")
+        self._run_adb_command(["shell", "input", "keyevent", str(keycode)])
     
     def _extract_text_tokens(self, screenshot_path: str) -> List[str]:
         """Best-effort OCR/token extraction from UI XML dump for exception detection."""
@@ -887,9 +926,9 @@ class PhoneAgent:
             remote_tmp = f"/sdcard/ui_dump_{self.context.get('session_id', 'sess')}.xml"
             local_tmp = str(Path(self.config.get('screenshot_dir', './screenshots')) / f"ui_dump_{int(time.time())}.xml")
 
-            self._run_adb_command(f"shell uiautomator dump {remote_tmp}")
-            self._run_adb_command(f"pull {remote_tmp} {local_tmp}")
-            self._run_adb_command(f"shell rm {remote_tmp}")
+            self._run_adb_command(["shell", "uiautomator", "dump", remote_tmp])
+            self._run_adb_command(["pull", remote_tmp, local_tmp])
+            self._run_adb_command(["shell", "rm", remote_tmp])
 
             if os.path.exists(local_tmp):
                 try:
@@ -966,6 +1005,7 @@ class PhoneAgent:
                 }
             return {'mode': 'none', 'handler_action': 'captcha_hitl_disabled', 'hitl': False, 'action': None}
 
+        # TODO(#5): 硬编码坐标命中率低，后续改为 VLM 分析弹窗截图或 uiautomator 查找按钮
         if exception_type == 'permission_popup':
             return {
                 'mode': 'blocking_popup',
@@ -990,6 +1030,7 @@ class PhoneAgent:
                 }
             }
 
+        # TODO(#5): login_guide 关闭按钮位置因机型差异很大
         if exception_type == 'login_guide':
             return {
                 'mode': 'blocking_popup',
@@ -1691,8 +1732,10 @@ class PhoneAgent:
 
         req_l = (user_request or '').lower()
         continuous_markers = [
-            '刷', '持续', '一直', '不停', 'for a while', 'keep', 'continuously',
-            'watch', 'scroll', 'reels', 'shorts'
+            '刷一会', '刷视频', '刷短视频', '持续', '一直', '不停',
+            'for a while', 'keep scrolling', 'continuously',
+            'watch videos', 'watch reels', 'scroll through',
+            'reels', 'shorts'
         ]
         self.context['continuous_task'] = any(k in req_l for k in continuous_markers)
 
@@ -1801,6 +1844,12 @@ class PhoneAgent:
 
         if task_complete:
             self._clear_checkpoint()
+
+        # Clean up old screenshots to prevent disk bloat (#14)
+        try:
+            self._cleanup_old_screenshots(keep_last=20)
+        except Exception as e:
+            logging.warning(f"Screenshot cleanup failed (non-fatal): {e}")
 
         return {
             'success': success,
