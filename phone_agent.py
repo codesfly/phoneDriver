@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional, Tuple, List
 
 from qwen_vl_agent import QwenVLAgent
 from replay_engine import ReplayEngine
+from model_router import ModelRouter
 
 
 def parse_wm_size_output(raw_output: str) -> Optional[Tuple[int, int]]:
@@ -336,7 +337,19 @@ class PhoneAgent:
             api_key=self.config.get('api_key') or None,
             api_model=self.config.get('api_model') or None,
             api_timeout=int(self.config.get('api_timeout', 120)),
+            enable_structured_output=self.config.get('enable_structured_output', True),
+            enable_prompt_caching=self.config.get('enable_prompt_caching', True),
         )
+
+        # Model Router (optimization #5): dynamic model selection for remote API
+        self.model_router: Optional[ModelRouter] = None
+        if self.config.get('use_remote_api', False) and self.config.get('enable_model_routing', True):
+            router_tiers = self.config.get('model_router_tiers')
+            self.model_router = ModelRouter(
+                tiers=router_tiers if isinstance(router_tiers, dict) else None
+            )
+            logging.info(f"Model Router enabled with tiers: {list(self.model_router.tiers.keys())}")
+
         logging.info("Phone agent ready")
     
     def _setup_logging(self):
@@ -1949,12 +1962,40 @@ class PhoneAgent:
             action = self.replay_engine.get_next_action(ui_tree_data)
 
         if not action:
+            # Build visual memory for multi-frame context (#4)
+            visual_mem = None
+            if self.config.get('enable_visual_memory', True):
+                mem_buf = self.context.get('_visual_memory_buffer', [])
+                if mem_buf:
+                    visual_mem = list(mem_buf)  # shallow copy
+
+            # Model routing (#5): dynamically switch model tier for remote API
+            _original_model = None
+            _original_temp = None
+            _original_maxtok = None
+            if self.model_router and self.vl_agent.use_remote_api:
+                _original_model = self.vl_agent.api_model
+                _original_temp = self.vl_agent.temperature
+                _original_maxtok = self.vl_agent.max_tokens
+                tier_name, tier_cfg = self.model_router.route(self.context)
+                self.vl_agent.api_model = tier_cfg.get('model', _original_model)
+                self.vl_agent.temperature = tier_cfg.get('temperature', _original_temp)
+                self.vl_agent.max_tokens = tier_cfg.get('max_tokens', _original_maxtok)
+                logging.info(f"ModelRouter: tier={tier_name} model={self.vl_agent.api_model}")
+
             action = self.vl_agent.analyze_screenshot(
                 screenshot_path,
                 user_request,
                 self.context,
-                ui_context=ui_tree_data if self.config.get('enable_ui_tree_injection', True) else None
+                ui_context=ui_tree_data if self.config.get('enable_ui_tree_injection', True) else None,
+                visual_memory=visual_mem,
             )
+
+            # Restore original model settings after call
+            if _original_model is not None:
+                self.vl_agent.api_model = _original_model
+                self.vl_agent.temperature = _original_temp
+                self.vl_agent.max_tokens = _original_maxtok
 
         if not action:
             raise Exception("Failed to get action from model")
@@ -1974,6 +2015,23 @@ class PhoneAgent:
         result.setdefault('exception_type', None)
         result.setdefault('handler_action', None)
         result.setdefault('hitl_triggered', False)
+
+        # Update self-reflection context (#3)
+        self.context['last_action'] = action
+
+        # Update visual memory buffer (#4)
+        if self.config.get('enable_visual_memory', True):
+            try:
+                from PIL import Image as _PILImage
+                img = _PILImage.open(screenshot_path)
+                mem_buf = self.context.setdefault('_visual_memory_buffer', [])
+                mem_buf.append(img)
+                # Keep only last 2 frames to limit memory
+                max_visual_depth = int(self.config.get('visual_memory_depth', 2))
+                if len(mem_buf) > max_visual_depth:
+                    self.context['_visual_memory_buffer'] = mem_buf[-max_visual_depth:]
+            except Exception:
+                pass  # Non-critical
 
         if result.get('success', False) and self.config.get('enable_smart_replay', True) and self.replay_engine.is_recording:
             self.replay_engine.record_step(ui_tree_data, action, result)
@@ -2003,6 +2061,10 @@ class PhoneAgent:
         self.context['last_exception_type'] = None
         self.context['last_handler_action'] = None
         self.context['last_hitl_triggered'] = False
+        # Optimization #3 (Self-Reflection): track last executed action
+        self.context['last_action'] = None
+        # Optimization #4 (Visual Memory): screenshot buffer for multi-frame context
+        self.context['_visual_memory_buffer'] = []
 
         req_l = (user_request or '').lower()
         continuous_markers = [

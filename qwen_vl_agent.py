@@ -25,6 +25,48 @@ class QwenVLAgent:
     2) OpenAI-compatible remote API (`use_remote_api=True`), e.g. qwen-plus/qwen3.5-plus
     """
 
+    # Function calling schema for structured output (optimization #5).
+    # Sent as `tools` in remote API requests to force the model to return
+    # a valid tool_call instead of free-form text, eliminating parse failures.
+    MOBILE_USE_TOOL_SCHEMA = {
+        "type": "function",
+        "function": {
+            "name": "mobile_use",
+            "description": (
+                "Use a touchscreen to interact with a mobile device. "
+                "The screen resolution is 999x999 where (0,0) is top-left."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["click", "swipe", "type", "wait", "terminate"],
+                        "description": "The action to perform.",
+                    },
+                    "coordinate": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "(x, y) click/swipe start. Range 0-999.",
+                    },
+                    "coordinate2": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "(x, y) swipe end. Range 0-999.",
+                    },
+                    "text": {"type": "string", "description": "Text for type action."},
+                    "time": {"type": "number", "description": "Seconds to wait."},
+                    "status": {
+                        "type": "string",
+                        "enum": ["success", "failure"],
+                        "description": "Task status for terminate.",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    }
+
     def __init__(
         self,
         model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
@@ -38,6 +80,8 @@ class QwenVLAgent:
         api_key: Optional[str] = None,
         api_model: Optional[str] = None,
         api_timeout: int = 120,
+        enable_structured_output: bool = True,
+        enable_prompt_caching: bool = True,
     ) -> None:
         """Initialize the Qwen3-VL agent."""
         self.model_name = model_name
@@ -45,6 +89,8 @@ class QwenVLAgent:
         self.max_tokens = max_tokens
         self.use_remote_api = use_remote_api
         self.api_timeout = api_timeout
+        self.enable_structured_output = enable_structured_output
+        self.enable_prompt_caching = enable_prompt_caching
 
         # System prompt matching official format
         self.system_prompt = """# Tools
@@ -225,8 +271,18 @@ Rules:
         context: Optional[Dict[str, Any]] = None,
         retry_feedback: Optional[Dict[str, Any]] = None,
         ui_context: Optional[List[Dict[str, Any]]] = None,
+        visual_memory: Optional[List[Image.Image]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Analyze a phone screenshot and determine the next action."""
+        """Analyze a phone screenshot and determine the next action.
+
+        Optimization #3 (Self-Reflection): when context contains a last_action,
+        the prompt asks the model to first verify whether the previous action
+        succeeded before deciding the next one.
+
+        Optimization #4 (Visual Memory): when visual_memory is provided (list of
+        PIL Images from previous cycles), they are prepended as context images
+        so the model can compare before/after states.
+        """
         try:
             # Load and resize image to prevent OOM
             image = Image.open(screenshot_path)
@@ -253,6 +309,20 @@ Rules:
             # Build user query in official format
             user_query = f"""The user query: {user_request}.
 Task progress (You have done the following operation on the current device): {history_str}."""
+
+            # Self-Reflection (#3): inject verification prompt when there's a previous action
+            if context and context.get("last_action") and not retry_feedback:
+                last_act = context["last_action"]
+                last_act_type = last_act.get("action", "unknown") if isinstance(last_act, dict) else "unknown"
+                last_obs = ""
+                if isinstance(last_act, dict):
+                    last_obs = last_act.get("observation", "") or last_act.get("reasoning", "")
+                user_query += (
+                    f"\n\nSelf-check: your last action was '{last_act_type}'"
+                    f"{(' (' + last_obs[:60] + ')') if last_obs else ''}. "
+                    "Before deciding the next action, verify: did the previous action succeed? "
+                    "If the screen looks unchanged or an error appeared, choose a corrective action instead."
+                )
 
             if ui_context:
                 simplified_ui = []
@@ -281,6 +351,24 @@ Task progress (You have done the following operation on the current device): {hi
                     " You must output a corrected action and avoid repeating the same failed action."
                 )
 
+            # Build user content with optional visual memory images
+            user_content: List[Dict[str, Any]] = []
+
+            # Visual Memory (#4): prepend previous frame(s) as context
+            if visual_memory:
+                for idx, prev_img in enumerate(visual_memory[-2:]):  # Max 2 previous frames
+                    # Resize previous frames to smaller resolution to save tokens
+                    mem_max = 640
+                    if max(prev_img.size) > mem_max:
+                        ratio = mem_max / max(prev_img.size)
+                        mem_size = tuple(int(d * ratio) for d in prev_img.size)
+                        prev_img = prev_img.resize(mem_size, Image.Resampling.LANCZOS)
+                    user_content.append({"type": "text", "text": f"[Previous screen {idx + 1}]:"})
+                    user_content.append({"type": "image", "image": prev_img})
+
+            user_content.append({"type": "text", "text": user_query})
+            user_content.append({"type": "image", "image": image})
+
             # Messages in official format
             messages = [
                 {
@@ -289,10 +377,7 @@ Task progress (You have done the following operation on the current device): {hi
                 },
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_query},
-                        {"type": "image", "image": image},
-                    ],
+                    "content": user_content,
                 },
             ]
 
@@ -379,16 +464,51 @@ Task progress (You have done the following operation on the current device): {hi
             return None
 
     def _generate_action_remote(self, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Generate an action from remote OpenAI-compatible API."""
+        """Generate an action from remote OpenAI-compatible API.
+
+        Optimization #5 (Structured Output): when enable_structured_output is True,
+        sends `tools` + `tool_choice` to force the model to return a structured
+        tool_call. The response is parsed directly from tool_calls without regex.
+
+        Optimization #2 (Prompt Caching): when enable_prompt_caching is True,
+        marks system message with `cache_control` so the API can cache it.
+        """
         try:
             endpoint = f"{self.api_base_url}/chat/completions"
-            payload = {
+            converted_messages = self._convert_messages_for_openai(messages)
+
+            # Prompt Caching: mark system message for caching
+            if self.enable_prompt_caching and converted_messages:
+                for msg in converted_messages:
+                    if msg.get("role") == "system":
+                        # OpenAI / Anthropic cache_control format
+                        if isinstance(msg.get("content"), list):
+                            for part in msg["content"]:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    part["cache_control"] = {"type": "ephemeral"}
+                        elif isinstance(msg.get("content"), str):
+                            msg["content"] = [
+                                {"type": "text", "text": msg["content"],
+                                 "cache_control": {"type": "ephemeral"}}
+                            ]
+                        break
+
+            payload: Dict[str, Any] = {
                 "model": self.api_model,
-                "messages": self._convert_messages_for_openai(messages),
+                "messages": converted_messages,
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
                 "stream": False,
             }
+
+            # Structured Output: inject tools schema to force function calling
+            if self.enable_structured_output:
+                payload["tools"] = [self.MOBILE_USE_TOOL_SCHEMA]
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": "mobile_use"},
+                }
+
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -409,25 +529,18 @@ Task progress (You have done the following operation on the current device): {hi
 
             message = choices[0].get("message", {})
 
-            # Prefer structured tool_calls first for API compatibility.
+            # --- Fast path: direct tool_calls parsing (structured output) ---
             tool_calls = message.get("tool_calls") or []
-            output_text = ""
             if isinstance(tool_calls, list) and tool_calls:
-                tc = tool_calls[0] or {}
-                fn = tc.get("function") or {}
-                fname = fn.get("name")
-                fargs = fn.get("arguments")
-                if fname and fargs is not None:
-                    if not isinstance(fargs, str):
-                        fargs = json.dumps(fargs, ensure_ascii=False)
-                    output_text = f"<tool_call>\n{{\"name\": \"{fname}\", \"arguments\": {fargs}}}\n</tool_call>"
-                    logging.debug("Remote API tool_calls detected; using structured function call")
+                action = self._parse_tool_call_direct(tool_calls[0], message)
+                if action is not None:
+                    return action
+                # If direct parse failed, fall through to text parsing
+                logging.warning("Direct tool_call parse failed; falling back to text parsing")
 
-            # Fallback 1: plain content
-            if not output_text:
-                output_text = self._extract_text_from_openai_content(message.get("content", ""))
+            # --- Slow path: regex-based text parsing (fallback) ---
+            output_text = self._extract_text_from_openai_content(message.get("content", ""))
 
-            # Fallback 2: reasoning content
             if not output_text:
                 output_text = self._extract_text_from_openai_content(message.get("reasoning_content", ""))
                 if output_text:
@@ -437,12 +550,109 @@ Task progress (You have done the following operation on the current device): {hi
                 logging.error(f"Remote API empty content: {message}")
                 return None
 
-            logging.debug(f"Remote model output: {output_text}")
+            logging.debug(f"Remote model output (text fallback): {output_text}")
             action = self._parse_action(output_text)
             return action
 
         except Exception as e:
             logging.error(f"Error generating remote action: {e}", exc_info=True)
+            return None
+
+    def _parse_tool_call_direct(
+        self, tool_call: Dict[str, Any], message: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Parse a structured tool_call response directly into internal action format.
+
+        This bypasses regex-based _parse_action entirely, providing a more robust
+        parsing path when the API returns structured function calls.
+        """
+        try:
+            fn = tool_call.get("function") or {}
+            fname = fn.get("name", "")
+            fargs = fn.get("arguments")
+
+            if not fname or fargs is None:
+                return None
+
+            args: Dict[str, Any]
+            if isinstance(fargs, str):
+                args = json.loads(fargs)
+            elif isinstance(fargs, dict):
+                args = fargs
+            else:
+                return None
+
+            action_type = args.get("action")
+            if not action_type:
+                logging.error("Structured tool_call missing 'action' in arguments")
+                return None
+
+            action: Dict[str, Any] = {"action": action_type}
+
+            # Coordinates (999x999 → normalized 0-1)
+            if "coordinate" in args:
+                coord = args["coordinate"]
+                if isinstance(coord, (list, tuple)) and len(coord) == 2:
+                    try:
+                        action["coordinates"] = [float(coord[0]) / 999.0, float(coord[1]) / 999.0]
+                    except (TypeError, ValueError):
+                        pass
+
+            if "coordinate2" in args:
+                coord2 = args["coordinate2"]
+                if isinstance(coord2, (list, tuple)) and len(coord2) == 2:
+                    try:
+                        action["coordinate2"] = [float(coord2[0]) / 999.0, float(coord2[1]) / 999.0]
+                    except (TypeError, ValueError):
+                        pass
+
+            # Swipe direction
+            if action_type == "swipe" and "coordinates" in action and "coordinate2" in action:
+                start = action["coordinates"]
+                end = action["coordinate2"]
+                dx = end[0] - start[0]
+                dy = end[1] - start[1]
+                action["direction"] = ("down" if dy > 0 else "up") if abs(dy) > abs(dx) else ("right" if dx > 0 else "left")
+
+            # Action name mapping
+            if action_type == "click":
+                action["action"] = "tap"
+
+            # Other fields
+            if "text" in args:
+                action["text"] = args["text"]
+            if "time" in args:
+                action["waitTime"] = int(float(args["time"]) * 1000)
+            if "status" in args:
+                action["status"] = args["status"]
+                action["message"] = f"Task {args['status']}"
+
+            # Extract thought/action from content (if model also returned text)
+            content_text = self._extract_text_from_openai_content(
+                message.get("content", "")
+            )
+            if content_text:
+                thought_match = re.search(r"Thought:\s*(.+?)(?:\n|$)", content_text)
+                action_match = re.search(r"Action:\s*(.+?)(?:\n|$)", content_text)
+                if thought_match:
+                    action["reasoning"] = thought_match.group(1).strip().strip('"')
+                if action_match:
+                    action["observation"] = action_match.group(1).strip().strip('"')
+
+            # Validate essentials
+            if action["action"] == "tap" and "coordinates" not in action:
+                logging.error("Structured tool_call: tap missing coordinates")
+                return None
+            if action["action"] == "type" and "text" not in action:
+                logging.error("Structured tool_call: type missing text")
+                return None
+
+            action["_structured_output"] = True
+            logging.debug(f"Structured tool_call parsed: {action.get('action')}")
+            return action
+
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logging.error(f"Failed to parse structured tool_call: {e}")
             return None
 
     def _parse_action(self, text: str) -> Optional[Dict[str, Any]]:
