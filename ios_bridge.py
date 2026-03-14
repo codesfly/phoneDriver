@@ -40,17 +40,31 @@ class IOSBridge:
         self.logs_dir = Path(str(cfg.get("ios_logs_dir", "./logs") or "./logs"))
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
-        self._tunnel_proc: Optional[subprocess.Popen] = None
-        self._runwda_proc: Optional[subprocess.Popen] = None
-        self._tunnel_log_handle = None
-        self._runwda_log_handle = None
-
-        self._session_id: Optional[str] = None
-        self._session_udid: Optional[str] = None
+        # Dictionary of UDID -> Session Context
+        # Context structure: {"tunnel_proc": Popen, "runwda_proc": Popen, "tunnel_log": file, "runwda_log": file, "session_id": str}
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+        self.max_sessions = max(1, int(cfg.get("ios_max_sessions", 8)))
 
         parsed = urlparse(self.wda_base_url)
         self._wda_host = parsed.hostname or "127.0.0.1"
         self._wda_port = int(parsed.port or 8100)
+
+    def _get_session_ctx(self, udid: str) -> Dict[str, Any]:
+        if udid not in self._sessions:
+            if len(self._sessions) >= self.max_sessions:
+                raise IOSBridgeError(
+                    f"Session pool limit reached ({self.max_sessions}). "
+                    f"Active UDIDs: {list(self._sessions.keys())}. "
+                    "Shutdown unused sessions before adding new devices."
+                )
+            self._sessions[udid] = {
+                "tunnel_proc": None,
+                "runwda_proc": None,
+                "tunnel_log": None,
+                "runwda_log": None,
+                "session_id": None,
+            }
+        return self._sessions[udid]
 
     def _ensure_macos(self):
         if platform.system() != "Darwin":
@@ -246,9 +260,11 @@ class IOSBridge:
         except Exception:
             return False
 
-    def _wait_wda_ready(self, timeout_s: Optional[int] = None):
+    def _wait_wda_ready(self, udid: str, timeout_s: Optional[int] = None):
         deadline = time.time() + float(timeout_s or self.wda_ready_timeout)
         last_err = ""
+
+        ctx = self._get_session_ctx(udid)
 
         while time.time() < deadline:
             try:
@@ -259,13 +275,13 @@ class IOSBridge:
                 last_err = str(e)
                 time.sleep(self.wda_ready_interval)
 
-        tunnel_tail = self._tail_text(self.logs_dir / "ios_tunnel.log")
-        runwda_tail = self._tail_text(self.logs_dir / "ios_runwda.log")
+        tunnel_tail = self._tail_text(self.logs_dir / f"ios_tunnel_{udid}.log")
+        runwda_tail = self._tail_text(self.logs_dir / f"ios_runwda_{udid}.log")
         raise IOSBridgeError(
-            "WDA not ready within timeout. "
+            f"WDA not ready within timeout for {udid}. "
             f"last_error={last_err}; "
-            f"tunnel_alive={self._proc_alive(self._tunnel_proc)}; "
-            f"runwda_alive={self._proc_alive(self._runwda_proc)}; "
+            f"tunnel_alive={self._proc_alive(ctx['tunnel_proc'])}; "
+            f"runwda_alive={self._proc_alive(ctx['runwda_proc'])}; "
             f"tunnel_log_tail={tunnel_tail}; "
             f"runwda_log_tail={runwda_tail}"
         )
@@ -326,7 +342,8 @@ class IOSBridge:
         self._ensure_go_ios()
 
         active_udid = self._resolve_udid(udid)
-        if self._proc_alive(self._tunnel_proc):
+        ctx = self._get_session_ctx(active_udid)
+        if self._proc_alive(ctx["tunnel_proc"]):
             return {"ok": True, "already_running": True}
 
         cmd = self._format_template_cmd(
@@ -334,11 +351,11 @@ class IOSBridge:
             [self.go_ios_bin, "tunnel", "--udid", "{udid}"],
             active_udid,
         )
-        log_path = self.logs_dir / "ios_tunnel.log"
-        proc, handle = self._start_background_process(cmd, log_path, "tunnel")
+        log_path = self.logs_dir / f"ios_tunnel_{active_udid}.log"
+        proc, handle = self._start_background_process(cmd, log_path, f"tunnel_{active_udid[:6]}")
 
-        self._tunnel_proc = proc
-        self._tunnel_log_handle = handle
+        ctx["tunnel_proc"] = proc
+        ctx["tunnel_log"] = handle
         return {"ok": True, "started": True, "command": cmd, "log": str(log_path)}
 
     def start_runwda(self, udid: Optional[str] = None) -> Dict[str, Any]:
@@ -347,7 +364,8 @@ class IOSBridge:
         self._ensure_go_ios()
 
         active_udid = self._resolve_udid(udid)
-        if self._proc_alive(self._runwda_proc):
+        ctx = self._get_session_ctx(active_udid)
+        if self._proc_alive(ctx["runwda_proc"]):
             return {"ok": True, "already_running": True}
 
         cmd = self._format_template_cmd(
@@ -355,11 +373,11 @@ class IOSBridge:
             [self.go_ios_bin, "runwda", "--udid", "{udid}"],
             active_udid,
         )
-        log_path = self.logs_dir / "ios_runwda.log"
-        proc, handle = self._start_background_process(cmd, log_path, "runwda")
+        log_path = self.logs_dir / f"ios_runwda_{active_udid}.log"
+        proc, handle = self._start_background_process(cmd, log_path, f"runwda_{active_udid[:6]}")
 
-        self._runwda_proc = proc
-        self._runwda_log_handle = handle
+        ctx["runwda_proc"] = proc
+        ctx["runwda_log"] = handle
         return {"ok": True, "started": True, "command": cmd, "log": str(log_path)}
 
     def ensure_wda_ready(self, udid: Optional[str] = None) -> Dict[str, Any]:
@@ -383,7 +401,7 @@ class IOSBridge:
                 "WDA not reachable and auto-start disabled (ios_auto_start_tunnel=false and ios_auto_start_runwda=false)."
             )
 
-        self._wait_wda_ready(self.wda_ready_timeout)
+        self._wait_wda_ready(active_udid, self.wda_ready_timeout)
         return {
             "ok": True,
             "wda_ready": True,
@@ -395,12 +413,13 @@ class IOSBridge:
     def create_session(self, udid: Optional[str] = None, force_new: bool = False) -> Dict[str, Any]:
         active_udid = self._resolve_udid(udid)
         self.ensure_wda_ready(active_udid)
+        ctx = self._get_session_ctx(active_udid)
 
-        if self._session_id and self._session_udid == active_udid and not force_new:
-            return {"ok": True, "session_id": self._session_id, "reused": True}
+        if ctx["session_id"] and not force_new:
+            return {"ok": True, "session_id": ctx["session_id"], "reused": True}
 
-        if force_new and self._session_id:
-            self.delete_session(ignore_missing=True)
+        if force_new and ctx["session_id"]:
+            self.delete_session(udid=active_udid, ignore_missing=True)
 
         payload = {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}
         data = self._wda_post("/session", payload)
@@ -414,27 +433,27 @@ class IOSBridge:
         if not sid:
             raise IOSBridgeError(f"WDA create session response missing sessionId: {data}")
 
-        self._session_id = str(sid)
-        self._session_udid = active_udid
-        return {"ok": True, "session_id": self._session_id, "reused": False}
+        ctx["session_id"] = str(sid)
+        return {"ok": True, "session_id": ctx["session_id"], "reused": False}
 
     def ensure_session(self, udid: Optional[str] = None) -> str:
         return str(self.create_session(udid=udid, force_new=False)["session_id"])
 
-    def delete_session(self, ignore_missing: bool = False) -> Dict[str, Any]:
-        if not self._session_id:
+    def delete_session(self, udid: Optional[str] = None, ignore_missing: bool = False) -> Dict[str, Any]:
+        active_udid = self._resolve_udid(udid)
+        ctx = self._get_session_ctx(active_udid)
+        if not ctx["session_id"]:
             return {"ok": True, "deleted": False, "reason": "no_session"}
 
-        sid = self._session_id
+        sid = ctx["session_id"]
         try:
             _ = self._wda_delete(f"/session/{sid}")
         except IOSBridgeError as e:
             if not ignore_missing:
                 raise
-            logging.info(f"Delete session ignored: {e}")
+            logging.info(f"Delete session ignored for {active_udid}: {e}")
 
-        self._session_id = None
-        self._session_udid = None
+        ctx["session_id"] = None
         return {"ok": True, "deleted": True, "session_id": sid}
 
     def prepare(self, udid: Optional[str] = None, ensure_session: bool = True) -> Dict[str, Any]:
@@ -448,32 +467,33 @@ class IOSBridge:
 
     def shutdown(self, stop_processes: bool = True, ignore_errors: bool = True) -> Dict[str, Any]:
         errors: List[str] = []
-        try:
-            self.delete_session(ignore_missing=True)
-        except Exception as e:
-            if not ignore_errors:
-                raise
-            errors.append(str(e))
-
-        if stop_processes:
+        for udid, ctx in list(self._sessions.items()):
             try:
-                self._stop_process(self._runwda_proc, self._runwda_log_handle, "runwda")
+                self.delete_session(udid=udid, ignore_missing=True)
             except Exception as e:
                 if not ignore_errors:
                     raise
-                errors.append(f"stop runwda failed: {e}")
+                errors.append(str(e))
 
-            try:
-                self._stop_process(self._tunnel_proc, self._tunnel_log_handle, "tunnel")
-            except Exception as e:
-                if not ignore_errors:
-                    raise
-                errors.append(f"stop tunnel failed: {e}")
+            if stop_processes:
+                try:
+                    self._stop_process(ctx.get("runwda_proc"), ctx.get("runwda_log"), f"runwda_{udid[:6]}")
+                except Exception as e:
+                    if not ignore_errors:
+                        raise
+                    errors.append(f"stop runwda {udid} failed: {e}")
 
-            self._runwda_proc = None
-            self._runwda_log_handle = None
-            self._tunnel_proc = None
-            self._tunnel_log_handle = None
+                try:
+                    self._stop_process(ctx.get("tunnel_proc"), ctx.get("tunnel_log"), f"tunnel_{udid[:6]}")
+                except Exception as e:
+                    if not ignore_errors:
+                        raise
+                    errors.append(f"stop tunnel {udid} failed: {e}")
+
+                ctx["runwda_proc"] = None
+                ctx["runwda_log"] = None
+                ctx["tunnel_proc"] = None
+                ctx["tunnel_log"] = None
 
         return {"ok": len(errors) == 0, "errors": errors}
 
@@ -553,10 +573,13 @@ class IOSBridge:
         return target
 
     def tap(self, x: int, y: int, udid: Optional[str] = None) -> Dict[str, Any]:
-        data = self._session_post("/wda/tap/0", {"x": int(x), "y": int(y)}, udid=udid)
-        return {"ok": True, "value": self._wda_value(data), "session_id": self._session_id}
+        active_udid = self._resolve_udid(udid)
+        data = self._session_post("/wda/tap/0", {"x": int(x), "y": int(y)}, udid=active_udid)
+        ctx = self._get_session_ctx(active_udid)
+        return {"ok": True, "value": self._wda_value(data), "session_id": ctx["session_id"]}
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration: float = 0.2, udid: Optional[str] = None) -> Dict[str, Any]:
+        active_udid = self._resolve_udid(udid)
         data = self._session_post(
             "/wda/dragfromtoforduration",
             {
@@ -566,16 +589,19 @@ class IOSBridge:
                 "toY": int(y2),
                 "duration": float(duration),
             },
-            udid=udid,
+            udid=active_udid,
         )
-        return {"ok": True, "value": self._wda_value(data), "session_id": self._session_id}
+        ctx = self._get_session_ctx(active_udid)
+        return {"ok": True, "value": self._wda_value(data), "session_id": ctx["session_id"]}
 
     def type_text(self, text: str, udid: Optional[str] = None) -> Dict[str, Any]:
+        active_udid = self._resolve_udid(udid)
         value = str(text or "")
         if not value:
             raise IOSBridgeError("type_text requires non-empty text")
-        data = self._session_post("/wda/keys", {"value": [value]}, udid=udid)
-        return {"ok": True, "value": self._wda_value(data), "session_id": self._session_id}
+        data = self._session_post("/wda/keys", {"value": [value]}, udid=active_udid)
+        ctx = self._get_session_ctx(active_udid)
+        return {"ok": True, "value": self._wda_value(data), "session_id": ctx["session_id"]}
 
     def source(self, udid: Optional[str] = None) -> str:
         data = self._session_get("/source", udid=udid)
@@ -585,15 +611,19 @@ class IOSBridge:
         return json.dumps(value, ensure_ascii=False)
 
     def launch_app(self, bundle_id: str, udid: Optional[str] = None) -> Dict[str, Any]:
+        active_udid = self._resolve_udid(udid)
         bid = str(bundle_id or "").strip()
         if not bid:
             raise IOSBridgeError("launch_app requires bundle_id")
-        data = self._session_post("/wda/apps/launch", {"bundleId": bid}, udid=udid)
-        return {"ok": True, "value": self._wda_value(data), "session_id": self._session_id}
+        data = self._session_post("/wda/apps/launch", {"bundleId": bid}, udid=active_udid)
+        ctx = self._get_session_ctx(active_udid)
+        return {"ok": True, "value": self._wda_value(data), "session_id": ctx["session_id"]}
 
     def terminate_app(self, bundle_id: str, udid: Optional[str] = None) -> Dict[str, Any]:
+        active_udid = self._resolve_udid(udid)
         bid = str(bundle_id or "").strip()
         if not bid:
             raise IOSBridgeError("terminate_app requires bundle_id")
-        data = self._session_post("/wda/apps/terminate", {"bundleId": bid}, udid=udid)
-        return {"ok": True, "value": self._wda_value(data), "session_id": self._session_id}
+        data = self._session_post("/wda/apps/terminate", {"bundleId": bid}, udid=active_udid)
+        ctx = self._get_session_ctx(active_udid)
+        return {"ok": True, "value": self._wda_value(data), "session_id": ctx["session_id"]}

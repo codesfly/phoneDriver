@@ -37,7 +37,13 @@ class Phase3FunctionTests(unittest.TestCase):
 
     def test_exception_classification_priority(self):
         agent = self._new_agent()
-        agent._extract_text_tokens = lambda _path: ["请完成验证码", "允许权限"]
+        # L1-7: detection now requires ≥2 keyword hits per exception type.
+        # Provide 2+ keywords for both captcha and permission so both qualify,
+        # but captcha_entry has higher priority and should be returned.
+        agent._extract_text_tokens = lambda _path: [
+            "请完成验证码", "安全验证",    # 2 hits for captcha_entry
+            "允许", "权限",               # 2 hits for permission_popup
+        ]
 
         exception_type = PhoneAgent._detect_ui_exception(agent, "/tmp/s.png")
         self.assertEqual(exception_type, "captcha_entry")

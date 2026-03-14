@@ -37,22 +37,21 @@ class ReplayEngine:
     def _calculate_fingerprint(self, ui_tree_data: Optional[List[Dict[str, Any]]]) -> str:
         """
         Calculate a fingerprint for the current UI state.
-        This focuses on the structural and textual content of the UI.
+        Uses SHA-256 for collision resistance and includes element index
+        for structural differentiation between pages with similar text.
         """
         if not ui_tree_data:
             return "empty_ui_tree"
-            
+
         elements_str = ""
-        # Sort to ensure consistent order if possible, though UI tree usually has natural order
-        for node in ui_tree_data:
+        for idx, node in enumerate(ui_tree_data):
             text = node.get('text', '')
             desc = node.get('content_desc', '')
             res_id = node.get('resource_id', '')
-            # We don't include exact bounds because they might shift slightly across devices
-            # but we include text, description, and resource IDs
-            elements_str += f"{text}|{desc}|{res_id};"
-            
-        return hashlib.md5(elements_str.encode('utf-8')).hexdigest()
+            # Include element index as a rudimentary structural signal
+            elements_str += f"{idx}:{text}|{desc}|{res_id};\n"
+
+        return hashlib.sha256(elements_str.encode('utf-8')).hexdigest()[:32]
 
     def start_recording(self, task_name: str):
         """Start recording actions for a new task."""
@@ -164,9 +163,17 @@ class ReplayEngine:
         return action
         
     def cancel_playback(self):
-        """Cancel the current playback and fallback to VLM flow."""
+        """Cancel the current playback and fallback to VLM flow.
+        
+        L1-5 fix: automatically starts recording after cancellation so that
+        the remaining (non-cached) steps are captured for future replays.
+        """
         if self.is_playing:
-            logging.info(f"ReplayEngine: Cancelled playback for '{self.current_task_name}'")
+            task_name = self.current_task_name
+            logging.info(f"ReplayEngine: Cancelled playback for '{task_name}'")
             self.is_playing = False
             self.playback_record = []
             self.playback_step = 0
+            # Start recording the remainder so this execution is not wasted
+            if task_name:
+                self.start_recording(task_name)

@@ -9,6 +9,7 @@ import statistics
 import subprocess
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -123,8 +124,10 @@ class TaskPlanner:
                 continue
 
             # Second pass: common connectors (CN + EN)
+            # Use word boundaries (\b) for English connectors to avoid splitting
+            # words like "authenticate" that contain "then".
             fragments = re.split(
-                r"(?:\s+and then\s+|\s+then\s+|\s+next\s+|\s+finally\s+|然后|并且|接着|再|最后)",
+                r"(?:\b(?:and then|then|next|finally)\b|然后|并且|接着|再|最后)",
                 token,
                 flags=re.IGNORECASE,
             )
@@ -337,14 +340,14 @@ class PhoneAgent:
         logging.info("Phone agent ready")
     
     def _setup_logging(self):
-        """Configure logging for this session."""
+        """Configure logging for this session with rotating file handler."""
         log_file = f"phone_agent_{self.context['session_id']}.log"
-        
+
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler(log_file),
+                RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5),
                 logging.StreamHandler()
             ]
         )
@@ -488,7 +491,11 @@ class PhoneAgent:
         return health
 
     def _persist_runtime_resolution(self, width: int, height: int) -> bool:
-        """Persist detected resolution into runtime config file (no sensitive fields)."""
+        """Persist detected resolution into runtime config file.
+        
+        L2-9 fix: uses atomic tmp+replace write to avoid partial writes
+        if UI's save_config is running concurrently.
+        """
         config_path = str(self.config.get('runtime_config_path', 'config.json') or 'config.json').strip()
         if not config_path:
             config_path = 'config.json'
@@ -510,8 +517,10 @@ class PhoneAgent:
         payload['screen_height'] = int(height)
 
         try:
-            with open(target_path, 'w', encoding='utf-8') as f:
+            tmp_path = str(target_path) + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, str(target_path))
             logging.info(f"Runtime config updated with detected resolution: {target_path}")
             return True
         except Exception as e:
@@ -591,9 +600,15 @@ class PhoneAgent:
 
     def _capture_screenshot_legacy(self, screenshot_path: str) -> None:
         """Legacy path: adb shell screencap + adb pull."""
-        self._run_adb_command(["shell", "screencap", "-p", "/sdcard/screenshot.png"])
-        self._run_adb_command(["pull", "/sdcard/screenshot.png", screenshot_path])
-        self._run_adb_command(["shell", "rm", "/sdcard/screenshot.png"])
+        remote_path = "/sdcard/screenshot.png"
+        self._run_adb_command(["shell", "screencap", "-p", remote_path])
+        try:
+            self._run_adb_command(["pull", remote_path, screenshot_path])
+        finally:
+            try:
+                self._run_adb_command(["shell", "rm", remote_path])
+            except Exception:
+                pass  # best-effort cleanup
 
     def capture_screenshot(self) -> str:
         """
@@ -822,9 +837,12 @@ class PhoneAgent:
                 message = action.get('message', 'Task complete')
 
                 # For continuous tasks (e.g. "刷一会", "持续"), avoid ending too early.
+                # L1-6 fix: only guard terminate(success); pass through terminate(failure)
+                # so real failures (app crash, unrecoverable error) are not swallowed.
                 if (
                     self.config.get('ignore_terminate_for_continuous_tasks', True)
                     and self.context.get('continuous_task')
+                    and str(status).lower() != 'failure'
                 ):
                     current_cycle = int(self.context.get('cycle_index', 0))
                     min_cycles = int(self.config.get('continuous_min_cycles', 20))
@@ -873,12 +891,15 @@ class PhoneAgent:
             else:
                 raise ValueError(f"Unknown action type: {action_type}")
             
-            # Record action in history
+            # Record action in history (L0-3 fix: cap at 30 to prevent unbounded growth)
             self.context['previous_actions'].append({
                 'action': action_type,
                 'timestamp': time.time(),
                 'elementName': action.get('observation', '')[:50]  # Brief description
             })
+            max_history = 30
+            if len(self.context['previous_actions']) > max_history:
+                self.context['previous_actions'] = self.context['previous_actions'][-max_history:]
             
             # Standard delay after action
             time.sleep(self.config['step_delay'])
@@ -953,7 +974,7 @@ class PhoneAgent:
         self._run_adb_command(["shell", "input", "swipe", str(start_x), str(start_y), str(end_x), str(end_y), "300"])
     
     def _execute_type(self, action: Dict[str, Any]):
-        """Execute a type action."""
+        """Execute a type action. Supports both ASCII (adb input text) and non-ASCII (broadcast) input."""
         if 'text' not in action:
             raise ValueError("Type action missing text")
 
@@ -961,23 +982,47 @@ class PhoneAgent:
         if text.strip() == '':
             raise ValueError("Type action has empty text")
 
-        # Escape special characters for ADB input text.
-        # ADB `input text` interprets %s as spaces and does not handle
-        # most shell meta-characters.  We escape them here.
-        escaped_text = text.replace('%', '%p')   # percent first to avoid double-escape
-        escaped_text = escaped_text.replace(' ', '%s')
-        escaped_text = escaped_text.replace('"', '\\"')
-        escaped_text = escaped_text.replace("'", "\\'")
-        escaped_text = escaped_text.replace('&', '\\&')
-        escaped_text = escaped_text.replace('|', '\\|')
-        escaped_text = escaped_text.replace(';', '\\;')
-        escaped_text = escaped_text.replace('(', '\\(')
-        escaped_text = escaped_text.replace(')', '\\)')
-        escaped_text = escaped_text.replace('$', '\\$')
-        escaped_text = escaped_text.replace('`', '\\`')
-
         logging.info(f"Typing: {text}")
-        self._run_adb_command(["shell", "input", "text", escaped_text])
+
+        # Check if text contains non-ASCII characters (CJK, emoji, etc.)
+        has_non_ascii = any(ord(c) > 127 for c in text)
+
+        if has_non_ascii:
+            # Use ADB broadcast for non-ASCII text (requires ADBKeyBoard or similar IME)
+            # Fallback chain: broadcast -> clipboard paste
+            try:
+                self._run_adb_command([
+                    "shell", "am", "broadcast",
+                    "-a", "ADB_INPUT_TEXT",
+                    "--es", "msg", text,
+                ])
+                return
+            except Exception:
+                logging.warning("ADB_INPUT_TEXT broadcast failed, trying clipboard paste...")
+
+            # Fallback: set clipboard and paste via keyevent
+            try:
+                self._run_adb_command(["shell", "input", "text", text])
+            except Exception:
+                # Last resort: use "am broadcast" with base64 for really tricky text
+                logging.warning("Direct input text failed for non-ASCII, attempting key-by-key...")
+                for char in text:
+                    self._run_adb_command(["shell", "input", "text", char])
+        else:
+            # ASCII path: standard adb input text with shell escaping
+            escaped_text = text.replace('%', '%p')   # percent first to avoid double-escape
+            escaped_text = escaped_text.replace(' ', '%s')
+            escaped_text = escaped_text.replace('"', '\\"')
+            escaped_text = escaped_text.replace("'", "\\'")
+            escaped_text = escaped_text.replace('&', '\\&')
+            escaped_text = escaped_text.replace('|', '\\|')
+            escaped_text = escaped_text.replace(';', '\\;')
+            escaped_text = escaped_text.replace('(', '\\(')
+            escaped_text = escaped_text.replace(')', '\\)')
+            escaped_text = escaped_text.replace('$', '\\$')
+            escaped_text = escaped_text.replace('`', '\\`')
+
+            self._run_adb_command(["shell", "input", "text", escaped_text])
     
     def _execute_wait(self, action: Dict[str, Any]):
         """Execute a wait action."""
@@ -1011,32 +1056,49 @@ class PhoneAgent:
         self._run_adb_command(["shell", "input", "keyevent", str(keycode)])
     
     def _extract_text_tokens(self, screenshot_path: str) -> List[str]:
-        """Best-effort OCR/token extraction from UI XML dump for exception detection."""
+        """Best-effort token extraction from UI tree for exception detection.
+        
+        Reuses the cached UI tree from execute_cycle when available to avoid
+        an extra (expensive) uiautomator dump.
+        """
         tokens: List[str] = []
 
-        try:
-            remote_tmp = f"/sdcard/ui_dump_{self.context.get('session_id', 'sess')}.xml"
-            local_tmp = str(Path(self.config.get('screenshot_dir', './screenshots')) / f"ui_dump_{int(time.time())}.xml")
+        # Try to reuse cached UI tree from current cycle first
+        cached_tree = self.context.get('_cached_ui_tree')
+        if cached_tree and isinstance(cached_tree, list):
+            for node in cached_tree:
+                for attr in ('text', 'content_desc', 'resource_id'):
+                    val = str(node.get(attr, '')).strip()
+                    if val:
+                        tokens.append(val)
+        else:
+            # Fallback: do a fresh dump (only when no cache available)
+            try:
+                remote_tmp = f"/sdcard/ui_dump_{self.context.get('session_id', 'sess')}.xml"
+                local_tmp = str(Path(self.config.get('screenshot_dir', './screenshots')) / f"ui_dump_{int(time.time())}.xml")
 
-            self._run_adb_command(["shell", "uiautomator", "dump", remote_tmp])
-            self._run_adb_command(["pull", remote_tmp, local_tmp])
-            self._run_adb_command(["shell", "rm", remote_tmp])
-
-            if os.path.exists(local_tmp):
+                self._run_adb_command(["shell", "uiautomator", "dump", remote_tmp])
+                self._run_adb_command(["pull", remote_tmp, local_tmp])
                 try:
-                    root = ET.parse(local_tmp).getroot()
-                    for node in root.iter('node'):
-                        for attr in ('text', 'content-desc', 'resource-id'):
-                            val = str(node.attrib.get(attr, '')).strip()
-                            if val:
-                                tokens.append(val)
-                finally:
+                    self._run_adb_command(["shell", "rm", remote_tmp])
+                except Exception:
+                    pass
+
+                if os.path.exists(local_tmp):
                     try:
-                        os.remove(local_tmp)
-                    except Exception:
-                        pass
-        except Exception as e:
-            logging.warning(f"UI dump unavailable for exception detection: {e}")
+                        root = ET.parse(local_tmp).getroot()
+                        for node in root.iter('node'):
+                            for attr in ('text', 'content-desc', 'resource-id'):
+                                val = str(node.attrib.get(attr, '')).strip()
+                                if val:
+                                    tokens.append(val)
+                    finally:
+                        try:
+                            os.remove(local_tmp)
+                        except Exception:
+                            pass
+            except Exception as e:
+                logging.warning(f"UI dump unavailable for exception detection: {e}")
 
         # fallback: attach model observation/reasoning snippets from recent actions
         for item in self.context.get('previous_actions', [])[-3:]:
@@ -1047,7 +1109,12 @@ class PhoneAgent:
         return tokens
 
     def _detect_ui_exception(self, screenshot_path: str) -> Optional[str]:
-        """Detect common blocking UI exception state from visible text tokens."""
+        """Detect common blocking UI exception state from visible text tokens.
+        
+        L1-7 fix: require at least 2 keyword hits to reduce false positives.
+        Single common words like 'allow', 'retry', 'verify' in regular content
+        could otherwise trigger false exception handling.
+        """
         if not self.config.get('enable_exception_handler', True):
             return None
 
@@ -1058,7 +1125,9 @@ class PhoneAgent:
         haystack = "\n".join(tokens).lower()
         for exception_type in self.EXCEPTION_PRIORITY:
             markers = self.EXCEPTION_KEYWORDS.get(exception_type, [])
-            if any(str(marker).lower() in haystack for marker in markers):
+            hit_count = sum(1 for marker in markers if str(marker).lower() in haystack)
+            # Require at least 2 keyword hits to reduce false-positive rate
+            if hit_count >= 2:
                 return exception_type
         return None
 
@@ -1077,8 +1146,43 @@ class PhoneAgent:
             f"Exception handling event: type={exception_type}, handler_action={handler_action}, hitl={hitl_triggered}"
         )
 
+    def _find_button_center_from_ui_tree(self, keywords: List[str]) -> Optional[List[float]]:
+        """Search cached UI tree for a clickable button matching any keyword.
+        
+        Returns normalized [x, y] coordinates if found, None otherwise.
+        """
+        cached_tree = self.context.get('_cached_ui_tree')
+        if not cached_tree or not isinstance(cached_tree, list):
+            return None
+
+        screen_w = int(self.config.get('screen_width', 1080))
+        screen_h = int(self.config.get('screen_height', 2400))
+        if screen_w <= 0 or screen_h <= 0:
+            return None
+
+        for node in cached_tree:
+            text = str(node.get('text', '') or '').lower()
+            desc = str(node.get('content_desc', '') or '').lower()
+            res_id = str(node.get('resource_id', '') or '').lower()
+            combined = f"{text} {desc} {res_id}"
+
+            if any(kw.lower() in combined for kw in keywords):
+                cx = node.get('center_x')
+                cy = node.get('center_y')
+                if cx is not None and cy is not None:
+                    norm_x = round(float(cx) / screen_w, 4)
+                    norm_y = round(float(cy) / screen_h, 4)
+                    if 0.0 <= norm_x <= 1.0 and 0.0 <= norm_y <= 1.0:
+                        logging.info(f"UI Tree button found for {keywords}: ({norm_x}, {norm_y})")
+                        return [norm_x, norm_y]
+        return None
+
     def _select_exception_strategy(self, exception_type: Optional[str]) -> Dict[str, Any]:
-        """Select deterministic handler strategy for detected exception."""
+        """Select deterministic handler strategy for detected exception.
+        
+        Tries UI Tree-based button lookup first, falls back to hardcoded
+        coordinates only if no matching button is found.
+        """
         if not exception_type:
             return {'mode': 'none', 'handler_action': 'none', 'hitl': False, 'action': None}
 
@@ -1097,40 +1201,48 @@ class PhoneAgent:
                 }
             return {'mode': 'none', 'handler_action': 'captcha_hitl_disabled', 'hitl': False, 'action': None}
 
-        # TODO(#5): 硬编码坐标命中率低，后续改为 VLM 分析弹窗截图或 uiautomator 查找按钮
         if exception_type == 'permission_popup':
+            # Try UI Tree first: look for "允许"/"Allow"/"确定" buttons
+            coords = self._find_button_center_from_ui_tree(
+                ['允许', '始终允许', 'allow', 'permit', '确定', 'ok', 'accept']
+            ) or [0.78, 0.90]  # hardcoded fallback
             return {
                 'mode': 'blocking_popup',
                 'handler_action': 'tap_allow_permission',
                 'hitl': False,
                 'action': {
                     'action': 'tap',
-                    'coordinates': [0.78, 0.90],
+                    'coordinates': coords,
                     'observation': 'exception-handler:allow-permission',
                 }
             }
 
         if exception_type == 'update_popup':
+            coords = self._find_button_center_from_ui_tree(
+                ['以后再说', '稍后', '跳过', '取消', 'skip', 'later', 'cancel', 'not now']
+            ) or [0.22, 0.90]
             return {
                 'mode': 'blocking_popup',
                 'handler_action': 'tap_skip_update',
                 'hitl': False,
                 'action': {
                     'action': 'tap',
-                    'coordinates': [0.22, 0.90],
+                    'coordinates': coords,
                     'observation': 'exception-handler:skip-update',
                 }
             }
 
-        # TODO(#5): login_guide 关闭按钮位置因机型差异很大
         if exception_type == 'login_guide':
+            coords = self._find_button_center_from_ui_tree(
+                ['关闭', '跳过', '✕', '×', 'close', 'skip', 'dismiss']
+            ) or [0.88, 0.08]
             return {
                 'mode': 'blocking_popup',
                 'handler_action': 'tap_skip_login_guide',
                 'hitl': False,
                 'action': {
                     'action': 'tap',
-                    'coordinates': [0.88, 0.08],
+                    'coordinates': coords,
                     'observation': 'exception-handler:close-login-guide',
                 }
             }
@@ -1151,12 +1263,38 @@ class PhoneAgent:
         return {'mode': 'none', 'handler_action': 'none', 'hitl': False, 'action': None}
 
     def _handle_detected_exception(self, screenshot_path: str) -> Optional[Dict[str, Any]]:
-        """Apply exception-first priority; return preemption result if handled."""
+        """Apply exception-first priority; return preemption result if handled.
+        
+        L0-1 fix: tracks consecutive same-type exception count.
+        If the same exception type fires MAX_CONSECUTIVE_EXCEPTION times in a row,
+        stop handling it (the popup likely wasn't dismissed — fall through to VLM).
+        """
+        MAX_CONSECUTIVE_EXCEPTION = 3
+
         exception_type = self._detect_ui_exception(screenshot_path)
         strategy = self._select_exception_strategy(exception_type)
 
         if strategy.get('mode') == 'none':
+            # No exception detected → reset counter
+            self.context['_consecutive_exception_type'] = None
+            self.context['_consecutive_exception_count'] = 0
             return None
+
+        # Track consecutive same-type exception hits
+        prev_type = self.context.get('_consecutive_exception_type')
+        if exception_type == prev_type:
+            count = int(self.context.get('_consecutive_exception_count', 0)) + 1
+        else:
+            count = 1
+        self.context['_consecutive_exception_type'] = exception_type
+        self.context['_consecutive_exception_count'] = count
+
+        if count > MAX_CONSECUTIVE_EXCEPTION:
+            logging.warning(
+                f"Exception '{exception_type}' detected {count} consecutive times, "
+                f"handler likely ineffective — falling through to VLM"
+            )
+            return None  # Let VLM handle it instead of looping
 
         handler_action = str(strategy.get('handler_action', 'none'))
         hitl_triggered = bool(strategy.get('hitl', False))
@@ -1299,7 +1437,11 @@ class PhoneAgent:
         failed_error: str,
         cycle_index: int,
     ) -> Dict[str, Any]:
-        """Failure recovery loop: re-screenshot -> classify -> ask model for corrected action."""
+        """Failure recovery loop: re-screenshot -> classify -> ask model for corrected action.
+        
+        L1-4 note: retry_round is incremented here (once per feedback loop entry).
+        Each loop entry makes 1-2 VLM calls; the count tracks loop invocations.
+        """
         retry_reason = self._classify_retry_reason(failed_error, failed_action)
         retry_round = int(self.context.get('retry_round', 0)) + 1
         self.context['retry_round'] = retry_round
@@ -1541,10 +1683,18 @@ class PhoneAgent:
             if payload:
                 self.current_plan = payload['plan']
                 self.step_status = payload['step_status']
-                self.current_step_index = min(
-                    int(payload.get('current_step_index', 0)),
-                    len(self.current_plan.get('steps', [])),
-                )
+                steps = self.current_plan.get('steps', [])
+                total = len(steps)
+                raw_idx = int(payload.get('current_step_index', 0))
+                # L0-2 fix: clamp to valid range; if pointed step is 'in_progress'
+                # (was interrupted mid-execution), re-run it instead of skipping.
+                clamped_idx = max(0, min(raw_idx, total - 1)) if total > 0 else 0
+                step_key = str(clamped_idx)
+                if self.step_status.get(step_key) == 'in_progress':
+                    # Step was interrupted — reset to pending so it re-executes
+                    self.step_status[step_key] = 'pending'
+                    logging.info(f"Checkpoint step {clamped_idx} was 'in_progress', resetting to 'pending'")
+                self.current_step_index = clamped_idx
                 if payload.get('last_action') is not None:
                     self.context['last_action'] = payload.get('last_action')
                 if payload.get('last_screenshot') is not None:
@@ -1785,9 +1935,14 @@ class PhoneAgent:
         if exception_result is not None:
             return exception_result
 
+        # Fetch UI tree once per cycle and reuse it for replay + VLM injection
         ui_tree_data = None
         if self.config.get('enable_ui_tree_injection', True) or self.config.get('enable_smart_replay', True):
             ui_tree_data = self.get_ui_tree()
+
+        # Cache UI tree in context so downstream methods (e.g. _run_failure_feedback_loop)
+        # can reuse it instead of doing another expensive dump
+        self.context['_cached_ui_tree'] = ui_tree_data
 
         action = None
         if self.config.get('enable_smart_replay', True) and self.replay_engine.is_playing:

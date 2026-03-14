@@ -166,9 +166,11 @@ Rules:
     @staticmethod
     def _image_to_data_url(image: Image.Image) -> str:
         buf = io.BytesIO()
-        image.save(buf, format="PNG")
+        # Use JPEG for significantly smaller base64 payload (~60-70% smaller than PNG)
+        rgb_image = image.convert("RGB") if image.mode != "RGB" else image
+        rgb_image.save(buf, format="JPEG", quality=80, optimize=True)
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return f"data:image/png;base64,{b64}"
+        return f"data:image/jpeg;base64,{b64}"
 
     def _convert_messages_for_openai(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         converted: List[Dict[str, Any]] = []
@@ -488,13 +490,30 @@ Task progress (You have done the following operation on the current device): {hi
             action: Dict[str, Any] = {"action": action_type}
 
             # Handle coordinates (convert from 999x999 space to normalized 0-1)
+            # L2-8 fix: validate coordinate type and range before division
             if "coordinate" in args:
                 coord = args["coordinate"]
-                action["coordinates"] = [coord[0] / 999.0, coord[1] / 999.0]
+                if not isinstance(coord, (list, tuple)) or len(coord) != 2:
+                    logging.error(f"Invalid coordinate format: {coord}")
+                    return None
+                try:
+                    cx, cy = float(coord[0]), float(coord[1])
+                except (TypeError, ValueError) as e:
+                    logging.error(f"Cannot parse coordinate values: {coord} ({e})")
+                    return None
+                action["coordinates"] = [cx / 999.0, cy / 999.0]
 
             if "coordinate2" in args:
                 coord2 = args["coordinate2"]
-                action["coordinate2"] = [coord2[0] / 999.0, coord2[1] / 999.0]
+                if not isinstance(coord2, (list, tuple)) or len(coord2) != 2:
+                    logging.error(f"Invalid coordinate2 format: {coord2}")
+                    return None
+                try:
+                    cx2, cy2 = float(coord2[0]), float(coord2[1])
+                except (TypeError, ValueError) as e:
+                    logging.error(f"Cannot parse coordinate2 values: {coord2} ({e})")
+                    return None
+                action["coordinate2"] = [cx2 / 999.0, cy2 / 999.0]
 
             # Handle swipe - convert to direction for compatibility
             if action_type == "swipe" and "coordinates" in action and "coordinate2" in action:

@@ -37,6 +37,23 @@ last_health_result = None
 _ios_service_instance: Optional[IOSBridgeService] = None
 _ios_service_config_hash: Optional[int] = None
 
+# Fields to mask when displaying config in the UI JSON editor
+_SENSITIVE_CONFIG_KEYS = {"api_key", "api_secret", "token", "password", "secret"}
+
+
+def _mask_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of config with sensitive fields masked for UI display."""
+    masked = dict(config)
+    for key in _SENSITIVE_CONFIG_KEYS:
+        if key in masked and masked[key]:
+            val = str(masked[key])
+            if len(val) > 8:
+                masked[key] = val[:4] + "****" + val[-4:]
+            else:
+                masked[key] = "****"
+    return masked
+
+
 TOS_NOTICE_TEXT = (
     "⚠️ 合规提醒：移动端自动化可能违反平台 TOS，仅限个人设备测试与合规场景。"
 )
@@ -207,10 +224,11 @@ def get_default_config():
 
 
 def save_config(config, config_path="config.json"):
-    """Save configuration to file."""
+    """Save configuration to file (thread-safe via _state_lock)."""
     try:
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
+        with _state_lock:
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
         return True
     except Exception as e:
         logging.error(f"保存配置失败: {e}")
@@ -322,6 +340,9 @@ def run_health_check(config: Optional[Dict[str, Any]] = None, persist_runtime_co
             if state == "device":
                 selected_device = dev_id
                 break
+
+    # Extract all ready devices to feed into dropdown choices
+    result["all_devices"] = [dev_id for dev_id, state in devices if state == "device"]
 
     if not selected_device:
         if not result["errors"]:
@@ -599,17 +620,45 @@ def auto_detect_resolution():
 
 
 def refresh_health_status_ui():
-    """Refresh startup health status and sync detected resolution to config/UI."""
+    """Refresh startup health status and sync detected resolution to config/UI. 
+       Return the required variables and Dropdown choices.
+    """
     result = run_health_check(current_config, persist_runtime_config=True)
     cfg = current_config or get_default_config()
     width = cfg.get("screen_width", 1080)
     height = cfg.get("screen_height", 2340)
+    devices = result.get("all_devices", [])
+    if not devices and result.get("device_id"):
+        devices = [result.get("device_id")]
+        
+    choice_list = [d for d in devices if d]
+    current_val = result.get("device_id") if choice_list else None
+    
+    # We update the dropdown options through gr.update()
+    device_update = gr.update(choices=choice_list, value=current_val)
+    
     return (
         format_health_result(result),
         width,
         height,
         json.dumps(cfg, indent=2, ensure_ascii=False),
+        device_update
     )
+
+def handle_device_dropdown_change(selected_device_id):
+    """When the user picks a device from the dropdown, switch effectively."""
+    global current_config
+    if not selected_device_id:
+        return "⚠️ 未选择设备"
+        
+    cfg = current_config or load_config()
+    cfg['device_id'] = selected_device_id
+    save_config(cfg, cfg.get("runtime_config_path", "config.json"))
+    current_config = cfg
+    
+    # Re-run health check basically tests and writes back resolution specific to the new device
+    result = run_health_check(current_config, persist_runtime_config=True)
+    return format_health_result(result)
 
 
 def clear_logs_fn():
@@ -974,15 +1023,25 @@ def create_ui():
                 with gr.Column(scale=3, min_width=200):
                     gr.Markdown("# 📱 PhoneDriver")
                 with gr.Column(scale=4, min_width=300):
-                    device_display = gr.Textbox(
-                        value=get_device_display_name(),
-                        label="当前设备",
-                        interactive=False,
+                    # Gather initial device list from startup health check
+                    initial_devs = []
+                    initial_val = None
+                    if last_health_result:
+                        initial_devs = last_health_result.get("all_devices", [])
+                        initial_val = last_health_result.get("device_id")
+                        if initial_val and initial_val not in initial_devs:
+                            initial_devs.append(initial_val)
+                    
+                    device_dropdown = gr.Dropdown(
+                        choices=initial_devs,
+                        value=initial_val,
+                        label="当前控制设备 (Multi-Device)",
+                        interactive=True,
                         elem_id="device-selector",
                     )
                 with gr.Column(scale=2, min_width=160):
                     with gr.Row():
-                        refresh_device_btn = gr.Button("🔄 刷新设备", size="sm")
+                        refresh_device_btn = gr.Button("🔄 检测/刷新设备", size="sm")
                         add_device_btn = gr.Button("➕ 添加设备", size="sm")
 
         # ── Main 3-column dashboard ─────────────────────────────
@@ -1157,9 +1216,9 @@ def create_ui():
                 settings_status = gr.Textbox(label="状态", interactive=False)
 
             config_editor = gr.Code(
-                label="配置 JSON",
+                label="配置 JSON（敏感字段已脱敏）",
                 language="json",
-                value=json.dumps(current_config, indent=2, ensure_ascii=False),
+                value=json.dumps(_mask_sensitive_config(current_config), indent=2, ensure_ascii=False),
                 lines=12,
             )
 
@@ -1261,17 +1320,21 @@ def create_ui():
 
         clear_logs_btn.click(fn=clear_logs_fn, outputs=log_output)
 
+        # Dropdown selection event
+        device_dropdown.change(
+            fn=handle_device_dropdown_change,
+            inputs=device_dropdown,
+            outputs=status_text,
+        )
+
         # Header device refresh
         refresh_device_btn.click(
             fn=refresh_health_status_ui,
-            outputs=[health_status, screen_width, screen_height, config_editor],
-        ).then(
-            fn=lambda: get_device_display_name(),
-            outputs=device_display,
+            outputs=[health_status, screen_width, screen_height, config_editor, device_dropdown],
         )
 
         add_device_btn.click(
-            fn=lambda: "ℹ️ 多设备管理即将支持，敬请期待！",
+            fn=lambda: "ℹ️ 多设备添加主要通过 ADB/WDA 底层暴露。点击刷新检测最新接入终端。",
             outputs=status_text,
         )
 
@@ -1283,10 +1346,7 @@ def create_ui():
 
         refresh_health_btn.click(
             fn=refresh_health_status_ui,
-            outputs=[health_status, screen_width, screen_height, config_editor],
-        ).then(
-            fn=lambda: get_device_display_name(),
-            outputs=device_display,
+            outputs=[health_status, screen_width, screen_height, config_editor, device_dropdown],
         )
 
         apply_btn.click(
@@ -1378,11 +1438,10 @@ def main():
 
     demo.queue()
     demo.launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=7860,
         share=False,
         show_error=True,
-        theme=dark_theme,
         css=CUSTOM_CSS,
     )
 
