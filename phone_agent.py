@@ -355,6 +355,8 @@ class PhoneAgent:
             from skills import SkillRegistry
             self.skill_registry = SkillRegistry(self)
             logging.info(f"Skills loaded: {list(self.skill_registry.list_skills().keys())}")
+            # Inject skill descriptions into VLM prompt
+            self.vl_agent.set_skill_descriptions(self.skill_registry.list_skills())
         except Exception as e:
             self.skill_registry = None
             logging.warning(f"Skills loading skipped: {e}")
@@ -909,6 +911,9 @@ class PhoneAgent:
 
             elif action_type == 'system':
                 self._execute_system(action)
+
+            elif action_type == 'use_skill':
+                self._execute_skill(action)
             
             else:
                 raise ValueError(f"Unknown action type: {action_type}")
@@ -1076,6 +1081,33 @@ class PhoneAgent:
         keycode = key_map[key_text]
         logging.info(f"System action: {key_text} (KEYCODE {keycode})")
         self._run_adb_command(["shell", "input", "keyevent", str(keycode)])
+
+    def _execute_skill(self, action: Dict[str, Any]):
+        """Execute a registered skill via SkillRegistry.
+        
+        The LLM outputs: {"action": "use_skill", "skill_name": "xxx", "skill_args": {...}}
+        We route this to self.skill_registry.run(skill_name, **skill_args).
+        """
+        skill_name = action.get('skill_name', '')
+        skill_args = action.get('skill_args', {})
+
+        if not skill_name:
+            raise ValueError("use_skill action missing 'skill_name'")
+
+        if not self.skill_registry:
+            raise RuntimeError("SkillRegistry not initialized, cannot execute skill")
+
+        if not isinstance(skill_args, dict):
+            skill_args = {}
+
+        logging.info(f"Invoking skill: {skill_name} with args: {skill_args}")
+        result = self.skill_registry.run(skill_name, **skill_args)
+
+        if result.success:
+            logging.info(f"Skill '{skill_name}' succeeded: {str(result.data)[:200]}")
+        else:
+            logging.warning(f"Skill '{skill_name}' failed: {result.error}")
+            raise RuntimeError(f"Skill execution failed: {result.error}")
     
     def _extract_text_tokens(self, screenshot_path: str) -> List[str]:
         """Best-effort token extraction from UI tree for exception detection.

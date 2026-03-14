@@ -34,15 +34,16 @@ class QwenVLAgent:
             "name": "mobile_use",
             "description": (
                 "Use a touchscreen to interact with a mobile device. "
-                "The screen resolution is 999x999 where (0,0) is top-left."
+                "The screen resolution is 999x999 where (0,0) is top-left. "
+                "You can also invoke high-level skills via action=use_skill."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["click", "swipe", "type", "wait", "terminate"],
-                        "description": "The action to perform.",
+                        "enum": ["click", "swipe", "type", "wait", "terminate", "use_skill"],
+                        "description": "The action to perform. Use 'use_skill' to invoke a registered skill.",
                     },
                     "coordinate": {
                         "type": "array",
@@ -60,6 +61,14 @@ class QwenVLAgent:
                         "type": "string",
                         "enum": ["success", "failure"],
                         "description": "Task status for terminate.",
+                    },
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Name of the skill to invoke. Required when action=use_skill.",
+                    },
+                    "skill_args": {
+                        "type": "object",
+                        "description": "Arguments to pass to the skill. Required when action=use_skill.",
                     },
                 },
                 "required": ["action"],
@@ -93,13 +102,13 @@ class QwenVLAgent:
         self.enable_prompt_caching = enable_prompt_caching
 
         # System prompt matching official format
-        self.system_prompt = """# Tools
+        self._base_system_prompt = """# Tools
 
 You may call one or more functions to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
-{"type": "function", "function": {"name": "mobile_use", "description": "Use a touchscreen to interact with a mobile device, and take screenshots.\n* This is an interface to a mobile device with touchscreen. You can perform actions like clicking, typing, swiping, etc.\n* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions.\n* The screen's resolution is 999x999.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.", "parameters": {"properties": {"action": {"description": "The action to perform. The available actions are:\n* `click`: Click the point on the screen with coordinate (x, y).\n* `swipe`: Swipe from the starting point with coordinate (x, y) to the end point with coordinates2 (x2, y2).\n* `type`: Input the specified text into the activated input box.\n* `wait`: Wait specified seconds for the change to happen.\n* `terminate`: Terminate the current task and report its completion status.", "enum": ["click", "swipe", "type", "wait", "terminate"], "type": "string"}, "coordinate": {"description": "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates to click. Required only by `action=click` and `action=swipe`. Range: 0-999.", "type": "array"}, "coordinate2": {"description": "(x, y): The end coordinates for swipe. Required only by `action=swipe`. Range: 0-999.", "type": "array"}, "text": {"description": "Required only by `action=type`.", "type": "string"}, "time": {"description": "The seconds to wait. Required only by `action=wait`.", "type": "number"}, "status": {"description": "The status of the task. Required only by `action=terminate`.", "type": "string", "enum": ["success", "failure"]}}, "required": ["action"], "type": "object"}}}
+{"type": "function", "function": {"name": "mobile_use", "description": "Use a touchscreen to interact with a mobile device, and take screenshots.\n* This is an interface to a mobile device with touchscreen. You can perform actions like clicking, typing, swiping, etc.\n* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions.\n* The screen's resolution is 999x999.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.", "parameters": {"properties": {"action": {"description": "The action to perform. The available actions are:\n* `click`: Click the point on the screen with coordinate (x, y).\n* `swipe`: Swipe from the starting point with coordinate (x, y) to the end point with coordinates2 (x2, y2).\n* `type`: Input the specified text into the activated input box.\n* `wait`: Wait specified seconds for the change to happen.\n* `terminate`: Terminate the current task and report its completion status.\n* `use_skill`: Invoke a registered high-level skill by name (see available skills below).", "enum": ["click", "swipe", "type", "wait", "terminate", "use_skill"], "type": "string"}, "coordinate": {"description": "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates to click. Required only by `action=click` and `action=swipe`. Range: 0-999.", "type": "array"}, "coordinate2": {"description": "(x, y): The end coordinates for swipe. Required only by `action=swipe`. Range: 0-999.", "type": "array"}, "text": {"description": "Required only by `action=type`.", "type": "string"}, "time": {"description": "The seconds to wait. Required only by `action=wait`.", "type": "number"}, "status": {"description": "The status of the task. Required only by `action=terminate`.", "type": "string", "enum": ["success", "failure"]}, "skill_name": {"description": "Name of the skill to invoke. Required only by `action=use_skill`.", "type": "string"}, "skill_args": {"description": "Arguments dict for the skill. Required only by `action=use_skill`.", "type": "object"}}, "required": ["action"], "type": "object"}}}
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
@@ -113,7 +122,12 @@ Rules:
 - Do not output anything else outside those three parts.
 - If finishing, use action=terminate in the tool call.
 - For each function call, there must be an "action" key in the "arguments" which denote the type of the action.
-- Coordinates are in 999x999 space where (0,0) is top-left and (999,999) is bottom-right."""
+- Coordinates are in 999x999 space where (0,0) is top-left and (999,999) is bottom-right.
+- When a task matches a registered skill, prefer `use_skill` over manual multi-step actions."""
+
+        # Inject registered skill descriptions (will be set by PhoneAgent)
+        self._skill_descriptions: Optional[Dict[str, str]] = None
+        self.system_prompt = self._base_system_prompt
 
         self.model = None
         self.processor = None
@@ -162,6 +176,29 @@ Rules:
         self.processor = AutoProcessor.from_pretrained(model_name)
         # For MoE Models You need to change to self.model=Qwen3VLMoeForConditionalGeneration.from_pretrained
         logging.info("Qwen3-VL local agent initialized successfully")
+
+    def set_skill_descriptions(self, skills: Dict[str, str]) -> None:
+        """Inject skill descriptions into the system prompt.
+
+        Called by PhoneAgent after SkillRegistry is initialized.
+        The LLM will see these descriptions and can invoke skills via use_skill.
+        """
+        self._skill_descriptions = skills
+        if not skills:
+            self.system_prompt = self._base_system_prompt
+            return
+
+        skill_block = "\n\n# Available Skills (use action=use_skill)\n"
+        for name, desc in skills.items():
+            skill_block += f"- **{name}**: {desc}\n"
+        skill_block += (
+            "\nTo invoke a skill, use:\n"
+            '{"name": "mobile_use", "arguments": '
+            '{"action": "use_skill", "skill_name": "<name>", "skill_args": {<args>}}}\n'
+            "Example: use_skill(app_launcher, {\"app_name\": \"抖音\"})\n"
+        )
+        self.system_prompt = self._base_system_prompt + skill_block
+        logging.info(f"Injected {len(skills)} skill descriptions into system prompt")
 
     @staticmethod
     def _load_openclaw_bailian_defaults() -> Dict[str, Optional[str]]:
