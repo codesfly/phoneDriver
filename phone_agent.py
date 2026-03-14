@@ -350,6 +350,15 @@ class PhoneAgent:
             )
             logging.info(f"Model Router enabled with tiers: {list(self.model_router.tiers.keys())}")
 
+        # Skill Registry: 自动注册所有内置 Skill
+        try:
+            from skills import SkillRegistry
+            self.skill_registry = SkillRegistry(self)
+            logging.info(f"Skills loaded: {list(self.skill_registry.list_skills().keys())}")
+        except Exception as e:
+            self.skill_registry = None
+            logging.warning(f"Skills loading skipped: {e}")
+
         logging.info("Phone agent ready")
     
     def _setup_logging(self):
