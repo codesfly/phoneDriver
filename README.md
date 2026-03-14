@@ -12,6 +12,10 @@
 ---
 
 ## 最新更新 (Recent Updates)
+- 🧩 **Skill 模块化引擎 (v0.7)**:
+  - **5 个内置 Skill** — SmartScroll / AppLauncher / OCRExtractor / FormFiller / ScreenshotComparator
+  - **LLM 自主调用** — Skill 清单自动注入 prompt，大模型可直接输出 `use_skill` 一步闭环，无需多轮 tap/swipe
+  - **标准化框架** — BaseSkill 抽象基类 + SkillRegistry 自动注册中心，新增 Skill 仅需继承并实现 `execute()`
 - 🧠 **LLM 深度优化 (v0.6)**:
   - **Structured Output** — 远程 API 强制 function calling，彻底消除模型输出格式解析失败
   - **Prompt Caching** — 系统提示词标记 `cache_control`，每次调用节省 ~800 input tokens
@@ -41,6 +45,14 @@
 - 🪞 **Self-Reflection** — 每轮自动验证上一步执行结果，主动纠偏
 - 🖼️ **Visual Memory** — 多帧截图上下文，模型可对比操作前后状态变化
 - 🔀 **Smart Model Router** — 按复杂度自动选择模型（简单操作用轻量模型，retry 用最强模型）
+
+### Skill 模块化引擎
+- 📜 **SmartScroll** — 智能滚动查找目标元素，内置到底检测 + VLM 视觉匹配
+- 🚀 **AppLauncher** — 按名称启动 App（30+ 中文包名映射 + 视觉搜索回退）
+- 🔍 **OCRExtractor** — VLM 驱动文字提取（余额/验证码/状态），支持区域过滤
+- ✍️ **FormFiller** — 自动定位表单字段 → 清空 → 输入，支持批量操作
+- 📸 **ScreenshotComparator** — 像素级截图对比，判断页面变化/滚动到底
+- 🤖 **LLM 自主调用** — Skill 清单动态注入 prompt，模型输出 `use_skill` 即可一步闭环
 
 ### 智能执行
 - 🧭 **失败反馈闭环** — 失败后自动分类原因、重截图、请求修正
@@ -233,15 +245,16 @@ adb devices -l
 
 ```
 截图 → Qwen3-VL 视觉分析 → 决策动作 → ADB/WDA 执行 → 检查结果 → 循环
-                                  ↓ 失败
-                          分类原因 → 修正策略 → 重试
+                              ↓ use_skill           ↓ 失败
+                    SkillRegistry → 一步闭环    分类原因 → 修正策略 → 重试
 ```
 
 1. **截图**：ADB/WDA 获取当前屏幕
 2. **视觉分析**：Qwen3-VL 识别界面并给出动作
-3. **执行动作**：tap / swipe / type / wait / system
-4. **失败闭环**：自动分类原因并请求修正动作
-5. **循环执行**：直到完成、到达预算、或用户停止
+3. **执行动作**：tap / swipe / type / wait / system / **use_skill**
+4. **Skill 路由**（可选）：模型判断任务匹配 Skill 时，直接调用 SkillRegistry 一步完成
+5. **失败闭环**：自动分类原因并请求修正动作
+6. **循环执行**：直到完成、到达预算、或用户停止
 
 ---
 
@@ -275,7 +288,18 @@ PYTHONPATH=. python -m pytest tests/ -v
 phoneDriver/
 ├── phone_agent.py       # 核心 Agent（ADB 控制、VLM 交互、任务执行）
 ├── qwen_vl_agent.py     # Qwen3-VL 模型接口（本地/远端 API）
+├── model_router.py      # 智能模型路由（按复杂度选择 tier）
 ├── ui.py                # Web Dashboard（深色主题 Gradio）
+├── replay_engine.py     # 智能轨迹回放引擎
+├── skills/              # Skill 模块化引擎
+│   ├── __init__.py      # 包入口（导出 BaseSkill/SkillResult/SkillRegistry）
+│   ├── base.py          # BaseSkill 抽象基类 + SkillResult 标准化结果
+│   ├── registry.py      # SkillRegistry 自动注册中心
+│   ├── smart_scroll.py  # 智能滚动 + 到底检测 + VLM 目标匹配
+│   ├── app_launcher.py  # App 启动器（30+ 中文包名映射）
+│   ├── ocr_extractor.py # VLM 文字提取（余额/验证码/状态）
+│   ├── form_filler.py   # 表单批量填写
+│   └── screenshot_comparator.py  # 像素级截图对比
 ├── ios_bridge.py        # iOS go-ios 底层桥接
 ├── ios_service.py       # iOS 服务层（prepare/health/action）
 ├── ios_http_api.py      # iOS REST API 服务
